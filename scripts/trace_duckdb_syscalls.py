@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import ctypes
+import ctypes.util
 import datetime
 import hashlib
 import json
@@ -17,10 +19,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 DEFAULT_DUCKDB = "build/release/duckdb"
 DEFAULT_DATABASE = ":memory:"
 DEFAULT_BUFFER_SIZE = "16m"
@@ -96,18 +100,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         choices=("query", "engine", "process"),
         help=(
-            "trace boundary; default is query with DTrace and process with strace"
+            "trace boundary; defaults to query with DTrace/bpftrace and process "
+            "with strace"
         ),
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "dtrace", "strace"),
+        choices=("auto", "dtrace", "strace", "bpftrace"),
         default="auto",
-        help="tracing backend (default: select from the host platform)",
+        help=(
+            "tracing backend (default: DTrace on macOS; strace for Linux process "
+            "scope and bpftrace for explicit Linux query/engine scope)"
+        ),
     )
     parser.add_argument(
         "--tracer",
-        help="path to dtrace or strace (mainly useful for nonstandard installs)",
+        help=(
+            "path to dtrace, strace, or bpftrace "
+            "(mainly useful for nonstandard installs)"
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -221,13 +232,19 @@ def read_sql(args: argparse.Namespace, stdin: Any = None) -> bytes:
     return data
 
 
-def select_backend(requested: str, system_name: Optional[str] = None) -> str:
+def select_backend(
+    requested: str,
+    system_name: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> str:
     if requested != "auto":
         return requested
     host = system_name if system_name is not None else platform.system()
     if host == "Darwin":
         return "dtrace"
     if host == "Linux":
+        if scope in ("query", "engine"):
+            return "bpftrace"
         return "strace"
     raise TraceError(
         "unsupported platform {}; supported platforms are macOS and Linux".format(host)
@@ -237,7 +254,7 @@ def select_backend(requested: str, system_name: Optional[str] = None) -> str:
 def select_scope(requested: Optional[str], backend: str) -> str:
     if requested:
         return requested
-    return "query" if backend == "dtrace" else "process"
+    return "query" if backend in ("dtrace", "bpftrace") else "process"
 
 
 def make_artifact_paths(
@@ -255,7 +272,12 @@ def make_artifact_paths(
         while output_dir.exists():
             output_dir = pathlib.Path("{}-{}".format(base, suffix))
             suffix += 1
-    raw_name = "raw.dtrace.jsonl" if backend == "dtrace" else "raw.strace"
+    if backend == "dtrace":
+        raw_name = "raw.dtrace.jsonl"
+    elif backend == "bpftrace":
+        raw_name = "raw.bpftrace.jsonl"
+    else:
+        raw_name = "raw.strace"
     paths: Dict[str, Optional[pathlib.Path]] = {
         "output_dir": output_dir,
         "raw": pathlib.Path(args.raw_trace).expanduser().absolute()
@@ -271,9 +293,15 @@ def make_artifact_paths(
         "metadata": pathlib.Path(args.metadata).expanduser().absolute()
         if args.metadata
         else output_dir / "metadata.json",
-        "program": output_dir / "dtrace-program.d"
-        if backend == "dtrace"
-        else None,
+        "program": (
+            output_dir / "dtrace-program.d"
+            if backend == "dtrace"
+            else (
+                output_dir / "bpftrace-program.bt"
+                if backend == "bpftrace"
+                else None
+            )
+        ),
     }
     artifacts = [
         path
@@ -281,7 +309,9 @@ def make_artifact_paths(
         if name != "output_dir" and path is not None
     ]
     if len({str(path) for path in artifacts}) != len(artifacts):
-        raise TraceError("raw trace, summary, metadata, and DTrace program paths must differ")
+        raise TraceError(
+            "raw trace, summary, metadata, and tracer program paths must differ"
+        )
     for path in artifacts:
         if path.exists():
             raise TraceError("refusing to overwrite existing artifact: {}".format(path))
@@ -388,6 +418,241 @@ def run_tracer(
         sys.stderr.buffer.write(stderr)
         sys.stderr.buffer.flush()
     return process.returncode, stderr, timed_out
+
+
+PAUSED_EXEC_CODE = (
+    "import os, signal, sys\n"
+    "os.kill(os.getpid(), signal.SIGSTOP)\n"
+    "os.execv(sys.argv[1], sys.argv[1:])\n"
+)
+
+
+def wait_for_process_stop(
+    process: subprocess.Popen[bytes], timeout: float = 5.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waited_pid, status = os.waitpid(
+            process.pid, os.WNOHANG | os.WUNTRACED
+        )
+        if waited_pid == 0:
+            time.sleep(0.01)
+            continue
+        if os.WIFSTOPPED(status):
+            return
+        process.returncode = os.waitstatus_to_exitcode(status)
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        detail = stderr.decode("utf-8", "replace").strip()
+        raise TraceError(
+            "DuckDB launcher exited before bpftrace could attach{}".format(
+                ": {}".format(detail) if detail else ""
+            )
+        )
+    terminate_process_group(process)
+    raise TraceError("timed out waiting for the DuckDB launcher to pause")
+
+
+def pump_bpftrace_output(
+    stream: Any,
+    raw_path: pathlib.Path,
+    ready: threading.Event,
+) -> None:
+    with raw_path.open("wb") as handle:
+        for line in iter(stream.readline, b""):
+            handle.write(line)
+            if not ready.is_set():
+                try:
+                    event = json.loads(line.decode("utf-8", "replace"))
+                except json.JSONDecodeError:
+                    event = {}
+                if event.get("type") == "trace_start":
+                    handle.flush()
+                    ready.set()
+    stream.close()
+
+
+def pump_stream(stream: Any, chunks: List[bytes]) -> None:
+    for chunk in iter(lambda: stream.read(65536), b""):
+        chunks.append(chunk)
+    stream.close()
+
+
+def write_stderr(data: bytes) -> None:
+    if data:
+        sys.stderr.buffer.write(data)
+        sys.stderr.buffer.flush()
+
+
+def run_bpftrace(
+    tracer: str,
+    program_path: pathlib.Path,
+    raw_path: pathlib.Path,
+    binary: str,
+    symbols: Sequence[str],
+    scope: str,
+    include_children: bool,
+    target: Sequence[str],
+    sql: bytes,
+    timeout: Optional[float],
+    suppress_stdout: bool,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, Optional[int], bytes, bool]:
+    stdout = subprocess.DEVNULL if suppress_stdout else None
+    launcher = [sys.executable, "-c", PAUSED_EXEC_CODE, *target]
+    try:
+        target_process = subprocess.Popen(
+            launcher,
+            stdin=subprocess.PIPE,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise TraceError("cannot start DuckDB launcher: {}".format(exc)) from exc
+
+    tracer_process: Optional[subprocess.Popen[bytes]] = None
+    target_stderr = b""
+    tracer_stderr_chunks: List[bytes] = []
+    output_thread: Optional[threading.Thread] = None
+    error_thread: Optional[threading.Thread] = None
+    previous_signal_handlers: Dict[int, Any] = {}
+
+    def handle_termination_signal(signum: int, _frame: Any) -> None:
+        raise TraceSignal(signum)
+
+    for signum in (signal.SIGHUP, signal.SIGTERM):
+        try:
+            previous_signal_handlers[signum] = signal.signal(
+                signum, handle_termination_signal
+            )
+        except (OSError, ValueError):
+            pass
+
+    try:
+        wait_for_process_stop(target_process)
+        program = build_bpftrace_program(
+            scope,
+            binary,
+            symbols,
+            target_process.pid,
+            include_children,
+        )
+        atomic_write_text(program_path, program)
+        command = build_bpftrace_command(
+            tracer,
+            program_path,
+            target_process.pid,
+        )
+        try:
+            tracer_process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            terminate_process_group(target_process)
+            target_process.communicate()
+            raise TraceError("cannot start bpftrace: {}".format(exc)) from exc
+
+        assert tracer_process.stdout is not None
+        assert tracer_process.stderr is not None
+        ready = threading.Event()
+        output_thread = threading.Thread(
+            target=pump_bpftrace_output,
+            args=(tracer_process.stdout, raw_path, ready),
+            daemon=True,
+        )
+        error_thread = threading.Thread(
+            target=pump_stream,
+            args=(tracer_process.stderr, tracer_stderr_chunks),
+            daemon=True,
+        )
+        output_thread.start()
+        error_thread.start()
+
+        attach_deadline = time.monotonic() + 10.0
+        while not ready.wait(0.05):
+            if tracer_process.poll() is not None:
+                break
+            if time.monotonic() >= attach_deadline:
+                break
+
+        if not ready.is_set():
+            attach_timed_out = tracer_process.poll() is None
+            terminate_process_group(target_process)
+            _, target_stderr = target_process.communicate()
+            if tracer_process.poll() is None:
+                terminate_process_group(tracer_process)
+            tracer_process.wait()
+            output_thread.join(timeout=2)
+            error_thread.join(timeout=2)
+            if attach_timed_out:
+                tracer_stderr_chunks.append(
+                    b"bpftrace: timed out waiting for probes to attach\n"
+                )
+            tracer_stderr = b"".join(tracer_stderr_chunks)
+            write_stderr(target_stderr)
+            write_stderr(tracer_stderr)
+            return tracer_process.returncode, None, tracer_stderr, False
+
+        os.killpg(target_process.pid, signal.SIGCONT)
+        timed_out = False
+        try:
+            _, target_stderr = target_process.communicate(
+                input=sql,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            terminate_process_group(target_process)
+            _, target_stderr = target_process.communicate()
+
+        target_returncode = None if timed_out else target_process.returncode
+        try:
+            tracer_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(tracer_process)
+            tracer_process.wait()
+        output_thread.join(timeout=2)
+        error_thread.join(timeout=2)
+        tracer_stderr = b"".join(tracer_stderr_chunks)
+        write_stderr(target_stderr)
+        write_stderr(tracer_stderr)
+        return (
+            tracer_process.returncode,
+            target_returncode,
+            tracer_stderr,
+            timed_out,
+        )
+    except BaseException:
+        if target_process.poll() is None:
+            terminate_process_group(target_process)
+        try:
+            _, remaining_target_stderr = target_process.communicate()
+            target_stderr += remaining_target_stderr
+        except (OSError, ValueError):
+            pass
+        if tracer_process is not None and tracer_process.poll() is None:
+            terminate_process_group(tracer_process)
+        if tracer_process is not None:
+            try:
+                tracer_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        if output_thread is not None:
+            output_thread.join(timeout=2)
+        if error_thread is not None:
+            error_thread.join(timeout=2)
+        write_stderr(target_stderr)
+        write_stderr(b"".join(tracer_stderr_chunks))
+        raise
+    finally:
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
 
 
 def parse_nm_symbols(output: str) -> List[str]:
@@ -646,6 +911,122 @@ dtrace:::END
     )
 
 
+def bpftrace_probe_list(
+    binary: str,
+    symbols: Sequence[str],
+    probe: str,
+) -> str:
+    binary_literal = json.dumps(binary)
+    return ",\n".join(
+        "{}:{}:{}".format(probe, binary_literal, symbol)
+        for symbol in symbols
+    )
+
+
+def build_bpftrace_program(
+    scope: str,
+    binary: str,
+    symbols: Sequence[str],
+    target_pid: int,
+    include_children: bool,
+) -> str:
+    if scope == "process":
+        raise TraceError(
+            "bpftrace process scope is not supported; use the strace backend"
+        )
+    if not symbols:
+        raise TraceError("bpftrace query scope requires a boundary symbol")
+
+    entry_probes = bpftrace_probe_list(binary, symbols, "uprobe")
+    return_probes = bpftrace_probe_list(binary, symbols, "uretprobe")
+    subject = "@tracked[pid]" if include_children else "pid == {}".format(target_pid)
+    descendant_tracking = ""
+    if include_children:
+        descendant_tracking = r"""
+tracepoint:sched:sched_process_fork
+/@tracked[pid]/
+{
+    @tracked[args->child_pid] = 1;
+}
+
+tracepoint:sched:sched_process_exit
+/pid == tid && @tracked[pid]/
+{
+    delete(@tracked[pid]);
+}
+"""
+
+    return r"""
+BEGIN
+{{
+    @tracked[{target_pid}] = 1;
+    printf("{{\"type\":\"trace_start\",\"scope\":\"{scope}\",\"ts_ns\":%llu,\"target_pid\":%d}}\n",
+        nsecs, {target_pid});
+}}
+
+{descendant_tracking}
+
+{entry_probes}
+/pid == {target_pid}/
+{{
+    @boundary_depth = @boundary_depth + 1;
+    printf("{{\"type\":\"boundary\",\"phase\":\"entry\",\"scope\":\"{scope}\",\"ts_ns\":%llu,\"pid\":%d,\"tid\":%d,\"depth\":%d}}\n",
+        nsecs, pid, tid, @boundary_depth);
+}}
+
+{return_probes}
+/pid == {target_pid} && @boundary_depth > 0/
+{{
+    printf("{{\"type\":\"boundary\",\"phase\":\"return\",\"scope\":\"{scope}\",\"ts_ns\":%llu,\"pid\":%d,\"tid\":%d,\"depth\":%d}}\n",
+        nsecs, pid, tid, @boundary_depth);
+    @boundary_depth = @boundary_depth - 1;
+}}
+
+tracepoint:raw_syscalls:sys_enter
+/@boundary_depth > 0 && ({subject})/
+{{
+    @syscall_started[tid] = nsecs;
+    @syscall_number[tid] = args->id;
+    printf("{{\"type\":\"call\",\"phase\":\"entry\",\"provider\":\"syscall\",\"syscall_nr\":%d,\"ts_ns\":%llu,\"pid\":%d,\"tid\":%d}}\n",
+        args->id, nsecs, pid, tid);
+}}
+
+tracepoint:raw_syscalls:sys_exit
+/@syscall_started[tid]/
+{{
+    $return_value = args->ret;
+    $duration = nsecs - @syscall_started[tid];
+    if ($return_value < 0 && $return_value >= -4095) {{
+        printf("{{\"type\":\"call\",\"phase\":\"return\",\"provider\":\"syscall\",\"syscall_nr\":%d,\"ts_ns\":%llu,\"pid\":%d,\"tid\":%d,\"return\":%lld,\"error\":%lld,\"duration_ns\":%llu}}\n",
+            @syscall_number[tid], nsecs, pid, tid, $return_value,
+            0 - $return_value, $duration);
+    }} else {{
+        printf("{{\"type\":\"call\",\"phase\":\"return\",\"provider\":\"syscall\",\"syscall_nr\":%d,\"ts_ns\":%llu,\"pid\":%d,\"tid\":%d,\"return\":%lld,\"error\":0,\"duration_ns\":%llu}}\n",
+            @syscall_number[tid], nsecs, pid, tid, $return_value, $duration);
+    }}
+    delete(@syscall_started[tid]);
+    delete(@syscall_number[tid]);
+}}
+
+END
+{{
+    printf("{{\"type\":\"trace_end\",\"scope\":\"{scope}\",\"ts_ns\":%llu,\"target_pid\":%d}}\n",
+        nsecs, {target_pid});
+    clear(@tracked);
+    clear(@boundary_depth);
+    clear(@syscall_started);
+    clear(@syscall_number);
+}}
+""".format(
+        target_pid=target_pid,
+        scope=scope,
+        descendant_tracking=descendant_tracking,
+        entry_probes=entry_probes,
+        return_probes=return_probes,
+        subject=subject,
+    )
+
+
 def build_dtrace_command(
     tracer: str,
     program_path: pathlib.Path,
@@ -671,6 +1052,22 @@ def build_dtrace_command(
         str(program_path),
         "-c",
         target_command,
+    ]
+
+
+def build_bpftrace_command(
+    tracer: str,
+    program_path: pathlib.Path,
+    target_pid: int,
+) -> List[str]:
+    return [
+        tracer,
+        "-q",
+        "-B",
+        "line",
+        "-p",
+        str(target_pid),
+        str(program_path),
     ]
 
 
@@ -727,6 +1124,35 @@ def tracer_failure_diagnostic(backend: str, stderr: str) -> Optional[str]:
             )
         if "dtrace:" in lowered and ("failed" in lowered or "error" in lowered):
             return "DTrace reported an instrumentation error; see stderr and dtrace-program.d."
+    elif backend == "bpftrace":
+        permission_patterns = (
+            "operation not permitted",
+            "permission denied",
+            "failed to load bpf",
+            "could not open bpf map",
+            "requires root",
+        )
+        if any(pattern in lowered for pattern in permission_patterns):
+            return (
+                "bpftrace could not load tracing programs. Run the command with "
+                "sudo and verify that the EC2 kernel permits eBPF tracing."
+            )
+        probe_patterns = (
+            "no probes to attach",
+            "failed to attach",
+            "could not attach",
+            "tracepoint not found",
+            "invalid probe",
+            "uprobe",
+        )
+        if any(pattern in lowered for pattern in probe_patterns):
+            return (
+                "bpftrace could not attach the DuckDB boundary or syscall probes; "
+                "inspect bpftrace-program.bt and verify the selected binary is "
+                "unstripped."
+            )
+        if "bpftrace:" in lowered or "error:" in lowered:
+            return "bpftrace reported an instrumentation error; see stderr."
     else:
         patterns = (
             "strace: can't stat",
@@ -761,13 +1187,15 @@ def dropped_event_count(stderr: str) -> int:
         )
         if not match:
             match = re.search(
-                r"\bdropped\s+([0-9]+)\s+(?:records?|events?)\b",
+                r"\b(?:dropped|lost)\s+([0-9]+)\s+(?:records?|events?)\b",
                 line,
                 re.IGNORECASE,
             )
         if match:
             total += int(match.group(1))
-    if total == 0 and re.search(r"\bdrop(?:ped|s)?\b", stderr, re.IGNORECASE):
+    if total == 0 and re.search(
+        r"\b(?:drop(?:ped|s)?|lost)\b", stderr, re.IGNORECASE
+    ):
         return -1
     return total
 
@@ -787,6 +1215,49 @@ def new_stats() -> Dict[str, Any]:
         "trace_starts": 0,
         "trace_ends": 0,
     }
+
+
+def normalized_syscall_name(value: str) -> str:
+    return re.sub(
+        r"^tracepoint:syscalls:sys_(?:enter|exit)_",
+        "",
+        value,
+    )
+
+
+_SYSCALL_NAME_RESOLVER: Any = None
+_SYSCALL_NAME_RESOLVER_INITIALIZED = False
+
+
+def resolve_linux_syscall_name(number: int) -> str:
+    global _SYSCALL_NAME_RESOLVER
+    global _SYSCALL_NAME_RESOLVER_INITIALIZED
+
+    if not _SYSCALL_NAME_RESOLVER_INITIALIZED:
+        _SYSCALL_NAME_RESOLVER_INITIALIZED = True
+        library_name = ctypes.util.find_library("seccomp") or "libseccomp.so.2"
+        try:
+            library = ctypes.CDLL(library_name)
+            arch_native = library.seccomp_arch_native
+            arch_native.argtypes = []
+            arch_native.restype = ctypes.c_uint32
+            resolve_number = library.seccomp_syscall_resolve_num_arch
+            resolve_number.argtypes = [ctypes.c_uint32, ctypes.c_int]
+            resolve_number.restype = ctypes.c_char_p
+            architecture = arch_native()
+
+            def resolver(value: int) -> Optional[bytes]:
+                return resolve_number(architecture, value)
+
+            _SYSCALL_NAME_RESOLVER = resolver
+        except (AttributeError, OSError):
+            _SYSCALL_NAME_RESOLVER = None
+
+    if _SYSCALL_NAME_RESOLVER is not None:
+        resolved = _SYSCALL_NAME_RESOLVER(number)
+        if resolved:
+            return resolved.decode("ascii", "replace")
+    return "nr_{}".format(number)
 
 
 def summarize_dtrace(path: pathlib.Path) -> Dict[str, Any]:
@@ -820,7 +1291,14 @@ def summarize_dtrace(path: pathlib.Path) -> Dict[str, Any]:
                 stats["entry_calls"] += 1
             elif event_type == "call" and event.get("phase") == "return":
                 provider = event.get("provider", "unknown")
-                call = event.get("call", "unknown")
+                call_value = event.get("call")
+                syscall_number = event.get("syscall_nr")
+                if call_value is not None:
+                    call = normalized_syscall_name(str(call_value))
+                elif syscall_number is not None:
+                    call = resolve_linux_syscall_name(int(syscall_number))
+                else:
+                    call = "unknown"
                 key = "{}:{}".format(provider, call)
                 duration = max(0, int(event.get("duration_ns", 0)))
                 item = stats["calls"][key]
@@ -832,6 +1310,10 @@ def summarize_dtrace(path: pathlib.Path) -> Dict[str, Any]:
                     item["errors"] += 1
                 stats["complete_calls"] += 1
     return stats
+
+
+def summarize_bpftrace(path: pathlib.Path) -> Dict[str, Any]:
+    return summarize_dtrace(path)
 
 
 def strace_line_match(line: str) -> Optional[re.Match[str]]:
@@ -888,15 +1370,21 @@ def render_summary(
         "Raw trace: {}".format(raw_path),
         "Complete calls: {}".format(stats["complete_calls"]),
     ]
-    if backend == "dtrace":
+    if backend in ("dtrace", "bpftrace"):
         lines.append(
             "Boundary events: {} entry, {} return".format(
                 stats["boundary_entries"], stats["boundary_returns"]
             )
         )
+    if backend == "dtrace":
         lines.append("DTrace error events: {}".format(stats["dtrace_errors"]))
+    if backend in ("dtrace", "bpftrace"):
         if dropped == -1:
-            lines.append("Dropped events: reported by DTrace (count unavailable)")
+            lines.append(
+                "Dropped events: reported by {} (count unavailable)".format(
+                    backend
+                )
+            )
         else:
             lines.append("Dropped events: {}".format(dropped))
     if stats["malformed_lines"]:
@@ -965,18 +1453,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     started = utc_now()
     try:
         args = parse_args(argv)
-        backend = select_backend(args.backend)
+        backend = select_backend(args.backend, scope=args.scope)
         scope = select_scope(args.scope, backend)
         if backend == "strace" and scope != "process":
             raise TraceError(
                 "{} scope is not available with baseline strace because strace "
                 "cannot observe DuckDB C++ function boundaries; use --scope process "
-                "or run the DTrace backend on macOS".format(scope)
+                "or use the bpftrace backend on Linux".format(scope)
             )
         if backend == "strace" and not args.children:
             raise TraceError(
                 "--no-children is not supported by the strace backend: -f is "
                 "required for DuckDB worker threads and also follows descendants"
+            )
+        if backend == "bpftrace" and scope == "process":
+            raise TraceError(
+                "process scope is not supported by the bpftrace backend; "
+                "use --backend strace --scope process"
             )
 
         sql = read_sql(args)
@@ -991,7 +1484,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pass
 
         symbols: List[Tuple[str, str]] = []
-        if backend == "dtrace" and scope != "process":
+        if backend in ("dtrace", "bpftrace") and scope != "process":
             symbols = resolve_boundary_symbols(binary, scope)
 
         target = duckdb_command(binary, database)
@@ -1005,56 +1498,95 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             command = build_dtrace_command(
                 tracer, program_path, raw_path, args.buffer_size, target
             )
-        else:
+        elif backend == "strace":
             command = build_strace_command(
                 tracer, raw_path, args.string_limit, target
             )
+        else:
+            command = []
 
         duckdb_version = command_version([binary, "--version"])
         tracer_version = command_version([tracer, "-V"])
 
-        tracer_returncode, stderr_bytes, timed_out = run_tracer(
-            command, sql, args.timeout, args.no_results
-        )
+        bpftrace_target_returncode: Optional[int] = None
+        if backend == "bpftrace":
+            program_path = paths["program"]
+            assert program_path is not None
+            (
+                tracer_returncode,
+                bpftrace_target_returncode,
+                stderr_bytes,
+                timed_out,
+            ) = run_bpftrace(
+                tracer,
+                program_path,
+                raw_path,
+                binary,
+                [symbol for symbol, _ in symbols],
+                scope,
+                args.children,
+                target,
+                sql,
+                args.timeout,
+                args.no_results,
+            )
+        else:
+            tracer_returncode, stderr_bytes, timed_out = run_tracer(
+                command, sql, args.timeout, args.no_results
+            )
         stderr_text = stderr_bytes.decode("utf-8", "replace")
         ended = utc_now()
-        dropped = dropped_event_count(stderr_text) if backend == "dtrace" else 0
-        stats = (
-            summarize_dtrace(raw_path)
-            if backend == "dtrace"
-            else summarize_strace(raw_path)
+        dropped = (
+            dropped_event_count(stderr_text)
+            if backend in ("dtrace", "bpftrace")
+            else 0
         )
+        if backend == "dtrace":
+            stats = summarize_dtrace(raw_path)
+        elif backend == "bpftrace":
+            stats = summarize_bpftrace(raw_path)
+        else:
+            stats = summarize_strace(raw_path)
 
         infrastructure_error: Optional[str] = None
         boundary_warning: Optional[str] = None
         if timed_out:
             process_status: Optional[int] = None
             effective_status = TIMEOUT_EXIT_STATUS
-        elif backend == "dtrace":
-            target_status = stats.get("target_exit_status")
-            process_status = int(target_status) if target_status is not None else None
+        elif backend in ("dtrace", "bpftrace"):
+            if backend == "dtrace":
+                target_status = stats.get("target_exit_status")
+                process_status = (
+                    int(target_status) if target_status is not None else None
+                )
+            else:
+                process_status = (
+                    normalize_exit_status(bpftrace_target_returncode)
+                    if bpftrace_target_returncode is not None
+                    else None
+                )
             if stats["trace_starts"] == 0:
                 infrastructure_error = tracer_failure_diagnostic(
                     backend, stderr_text
-                ) or "DTrace did not record a trace-start event."
+                ) or "{} did not record a trace-start event.".format(backend)
             elif tracer_returncode != 0:
                 infrastructure_error = tracer_failure_diagnostic(
                     backend, stderr_text
                 ) or (
-                    "DTrace exited with status {}.".format(
+                    "{} exited with status {}.".format(
+                        backend,
                         normalize_exit_status(tracer_returncode)
                     )
                 )
-            elif stats["dtrace_errors"]:
+            elif backend == "dtrace" and stats["dtrace_errors"]:
                 infrastructure_error = (
                     "DTrace reported {} runtime error event(s).".format(
                         stats["dtrace_errors"]
                     )
                 )
             elif process_status is None:
-                infrastructure_error = infrastructure_error or (
-                    "DTrace did not record DuckDB's exit syscall; the target exit "
-                    "status cannot be preserved."
+                infrastructure_error = (
+                    "{} did not preserve DuckDB's exit status.".format(backend)
                 )
             if (
                 scope != "process"
@@ -1142,13 +1674,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "effective_exit_status": effective_status,
             "raw_trace": str(raw_path),
             "summary": str(summary_path) if summary_path else None,
-            "dropped_events": dropped if backend == "dtrace" else None,
+            "dropped_events": (
+                dropped if backend in ("dtrace", "bpftrace") else None
+            ),
             "complete_calls": stats["complete_calls"],
             "boundary_entries": stats["boundary_entries"]
-            if backend == "dtrace"
+            if backend in ("dtrace", "bpftrace")
             else None,
             "boundary_returns": stats["boundary_returns"]
-            if backend == "dtrace"
+            if backend in ("dtrace", "bpftrace")
             else None,
             "boundary_warning": boundary_warning,
             "dtrace_error_events": stats["dtrace_errors"]
@@ -1170,11 +1704,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         eprint("Metadata: {}".format(metadata_path))
         if dropped:
             count_text = "an unknown number of" if dropped == -1 else str(dropped)
-            eprint(
-                "warning: DTrace reported {} dropped events; increase --buffer-size".format(
-                    count_text
+            if backend == "dtrace":
+                eprint(
+                    "warning: DTrace reported {} dropped events; "
+                    "increase --buffer-size".format(count_text)
                 )
-            )
+            else:
+                eprint(
+                    "warning: bpftrace reported {} lost events; "
+                    "the trace may be incomplete".format(count_text)
+                )
         if infrastructure_error:
             eprint("trace error: {}".format(infrastructure_error))
         if boundary_warning:

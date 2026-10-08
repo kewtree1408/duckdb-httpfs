@@ -184,6 +184,79 @@ with open(raw_path, "w", encoding="utf-8") as handle:
 raise SystemExit(0)
 """
 
+FAKE_BPFTRACE = r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+if sys.argv[1:] == ["-V"]:
+    print("bpftrace v0.fake")
+    raise SystemExit(0)
+
+target_pid = int(sys.argv[sys.argv.index("-p") + 1])
+program_path = sys.argv[-1]
+program = open(program_path, encoding="utf-8").read()
+scope = "engine" if "_fake_connection_query" in program else "query"
+no_boundary = os.environ.get("FAKE_BPFTRACE_NO_BOUNDARY") == "1"
+
+def emit(event):
+    print(json.dumps(event), flush=True)
+
+emit({"type": "trace_start", "scope": scope, "ts_ns": 1, "target_pid": target_pid})
+if not no_boundary:
+    emit({
+        "type": "boundary",
+        "phase": "entry",
+        "scope": scope,
+        "ts_ns": 2,
+        "pid": target_pid,
+        "tid": target_pid,
+        "depth": 1,
+    })
+    emit({
+        "type": "call",
+        "phase": "entry",
+        "provider": "syscall",
+        "call": "tracepoint:syscalls:sys_enter_read",
+        "ts_ns": 3,
+        "pid": target_pid,
+        "tid": target_pid,
+    })
+    emit({
+        "type": "call",
+        "phase": "return",
+        "provider": "syscall",
+        "call": "tracepoint:syscalls:sys_exit_read",
+        "ts_ns": 4,
+        "pid": target_pid,
+        "tid": target_pid,
+        "return": 1,
+        "error": 0,
+        "duration_ns": 1000,
+    })
+
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    try:
+        os.kill(target_pid, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.01)
+
+if not no_boundary:
+    emit({
+        "type": "boundary",
+        "phase": "return",
+        "scope": scope,
+        "ts_ns": 5,
+        "pid": target_pid,
+        "tid": target_pid,
+        "depth": 1,
+    })
+emit({"type": "trace_end", "scope": scope, "ts_ns": 6, "target_pid": target_pid})
+"""
+
 FAKE_NM = r"""#!/usr/bin/env python3
 print("0000000000001000 T _fake_execute_sql")
 print("0000000000002000 T _fake_connection_query")
@@ -331,6 +404,63 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("-yy", command)
         self.assertEqual(command[-3:], ["--", "/tmp/duckdb", ":memory:"])
 
+    def test_linux_query_scope_auto_selects_bpftrace(self):
+        self.assertEqual(
+            TRACE.select_backend("auto", system_name="Linux", scope="query"),
+            "bpftrace",
+        )
+        self.assertEqual(
+            TRACE.select_backend("auto", system_name="Linux", scope="process"),
+            "strace",
+        )
+
+    def test_bpftrace_program_gates_all_threads_to_query_boundary(self):
+        program = TRACE.build_bpftrace_program(
+            "query",
+            "/tmp/duck db",
+            ["_fake_execute_sql"],
+            1234,
+            True,
+        )
+        self.assertIn('uprobe:"/tmp/duck db":_fake_execute_sql', program)
+        self.assertIn('uretprobe:"/tmp/duck db":_fake_execute_sql', program)
+        self.assertIn("tracepoint:raw_syscalls:sys_enter", program)
+        self.assertIn("tracepoint:raw_syscalls:sys_exit", program)
+        self.assertIn('"syscall_nr\\":%d', program)
+        self.assertIn("@boundary_depth > 0 && (@tracked[pid])", program)
+        self.assertIn("tracepoint:sched:sched_process_fork", program)
+        self.assertIn('"type\\":\\"boundary', program)
+
+    def test_bpftrace_no_children_keeps_worker_threads(self):
+        program = TRACE.build_bpftrace_program(
+            "engine",
+            "/tmp/duckdb",
+            ["_fake_connection_query"],
+            1234,
+            False,
+        )
+        self.assertIn("@boundary_depth > 0 && (pid == 1234)", program)
+        self.assertNotIn("sched_process_fork", program)
+
+    def test_bpftrace_command_attaches_to_paused_target(self):
+        command = TRACE.build_bpftrace_command(
+            "/usr/bin/bpftrace",
+            pathlib.Path("/tmp/program.bt"),
+            1234,
+        )
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/bpftrace",
+                "-q",
+                "-B",
+                "line",
+                "-p",
+                "1234",
+                "/tmp/program.bt",
+            ],
+        )
+
 class SummaryTests(unittest.TestCase):
     def test_dtrace_summary_groups_calls_and_extracts_exit_status(self):
         events = [
@@ -426,6 +556,33 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(stats["calls"]["syscall:poll"]["count"], 1)
             self.assertEqual(stats["calls"]["syscall:read"]["total_ns"], 10_000)
 
+    def test_bpftrace_summary_resolves_raw_syscall_numbers(self):
+        event = {
+            "type": "call",
+            "phase": "return",
+            "provider": "syscall",
+            "syscall_nr": 1,
+            "return": 5,
+            "error": 0,
+            "duration_ns": 3000,
+        }
+        previous_resolver = TRACE._SYSCALL_NAME_RESOLVER
+        previous_initialized = TRACE._SYSCALL_NAME_RESOLVER_INITIALIZED
+        try:
+            TRACE._SYSCALL_NAME_RESOLVER_INITIALIZED = True
+            TRACE._SYSCALL_NAME_RESOLVER = lambda number: (
+                b"write" if number == 1 else None
+            )
+            with tempfile.TemporaryDirectory() as temporary:
+                raw = pathlib.Path(temporary) / "raw.bpftrace.jsonl"
+                raw.write_text(json.dumps(event) + "\n", encoding="utf-8")
+                stats = TRACE.summarize_bpftrace(raw)
+            self.assertEqual(stats["calls"]["syscall:write"]["count"], 1)
+            self.assertEqual(stats["calls"]["syscall:write"]["total_ns"], 3000)
+        finally:
+            TRACE._SYSCALL_NAME_RESOLVER = previous_resolver
+            TRACE._SYSCALL_NAME_RESOLVER_INITIALIZED = previous_initialized
+
     def test_dropped_events_are_detected(self):
         self.assertEqual(
             TRACE.dropped_event_count("dtrace: 42 dynamic variable drops"), 42
@@ -452,6 +609,14 @@ class SummaryTests(unittest.TestCase):
         )
         self.assertIn("could not trace DuckDB", diagnostic)
 
+    def test_bpftrace_permission_error_is_actionable(self):
+        diagnostic = TRACE.tracer_failure_diagnostic(
+            "bpftrace",
+            "ERROR: failed to load BPF program: Operation not permitted",
+        )
+        self.assertIn("sudo", diagnostic)
+        self.assertIn("eBPF", diagnostic)
+
 
 class CommandIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -460,16 +625,19 @@ class CommandIntegrationTests(unittest.TestCase):
         self.duckdb = self.root / "fake duckdb"
         self.strace = self.root / "fake strace"
         self.dtrace = self.root / "fake dtrace"
+        self.bpftrace = self.root / "fake bpftrace"
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
         self.duckdb.write_text(FAKE_DUCKDB, encoding="utf-8")
         self.strace.write_text(FAKE_STRACE, encoding="utf-8")
         self.dtrace.write_text(FAKE_DTRACE, encoding="utf-8")
+        self.bpftrace.write_text(FAKE_BPFTRACE, encoding="utf-8")
         (self.fake_bin / "nm").write_text(FAKE_NM, encoding="utf-8")
         (self.fake_bin / "c++filt").write_text(FAKE_CXXFILT, encoding="utf-8")
         self.duckdb.chmod(0o755)
         self.strace.chmod(0o755)
         self.dtrace.chmod(0o755)
+        self.bpftrace.chmod(0o755)
         (self.fake_bin / "nm").chmod(0o755)
         (self.fake_bin / "c++filt").chmod(0o755)
 
@@ -556,6 +724,53 @@ class CommandIntegrationTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             env=env,
             check=False,
+        )
+        return completed, run_dir, capture, argv_capture
+
+    def run_bpftrace_tool(
+        self,
+        query,
+        scope="query",
+        run_name="bpftrace-run",
+        extra_env=None,
+        extra=None,
+    ):
+        run_dir = self.root / run_name
+        capture = self.root / "{}-sql.bin".format(run_name)
+        argv_capture = self.root / "{}-argv.json".format(run_name)
+        env = os.environ.copy()
+        env["FAKE_SQL_CAPTURE"] = str(capture)
+        env["FAKE_ARGV_CAPTURE"] = str(argv_capture)
+        env["PATH"] = "{}{}{}".format(
+            self.fake_bin, os.pathsep, env.get("PATH", "")
+        )
+        if extra_env:
+            env.update(extra_env)
+        command = [
+            sys.executable,
+            str(SCRIPT),
+            "--backend",
+            "bpftrace",
+            "--scope",
+            scope,
+            "--duckdb",
+            str(self.duckdb),
+            "--tracer",
+            str(self.bpftrace),
+            "--output-dir",
+            str(run_dir),
+            "--sql",
+            query.decode("utf-8"),
+        ]
+        if extra:
+            command.extend(extra)
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+            timeout=15,
         )
         return completed, run_dir, capture, argv_capture
 
@@ -734,6 +949,115 @@ class CommandIntegrationTests(unittest.TestCase):
             "ShellState::ExecuteSQL",
             metadata["boundary_symbols"][0]["demangled"],
         )
+
+    def test_bpftrace_query_scope_preserves_sql_output_and_exit_status(self):
+        query = b"SELECT 1;\nSELECT 2;\n"
+        completed, run_dir, capture, argv_capture = self.run_bpftrace_tool(
+            query
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(capture.read_bytes(), query)
+        self.assertEqual(completed.stdout, b"duckdb-output\n" + query)
+        argv = json.loads(argv_capture.read_text(encoding="utf-8"))
+        self.assertEqual(argv[:3], ["--no-init", "--batch", "--bail"])
+        metadata = json.loads(
+            (run_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(metadata["backend"], "bpftrace")
+        self.assertEqual(metadata["duckdb_exit_status"], 0)
+        self.assertEqual(metadata["boundary_entries"], 1)
+        self.assertEqual(metadata["boundary_returns"], 1)
+        self.assertEqual(metadata["complete_calls"], 1)
+        self.assertTrue((run_dir / "bpftrace-program.bt").exists())
+        raw = (run_dir / "raw.bpftrace.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"trace_start"', raw)
+        summary = (run_dir / "summary.txt").read_text(encoding="utf-8")
+        self.assertIn("syscall:read", summary)
+
+    def test_bpftrace_preserves_failing_duckdb_status(self):
+        completed, run_dir, _, _ = self.run_bpftrace_tool(
+            b"SELECT FAIL_QUERY;\n",
+            run_name="bpftrace-failure",
+        )
+        self.assertEqual(completed.returncode, 7, completed.stderr)
+        metadata = json.loads(
+            (run_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(metadata["tracer_exit_status"], 0)
+        self.assertEqual(metadata["duckdb_exit_status"], 7)
+        self.assertEqual(metadata["effective_exit_status"], 7)
+
+    def test_bpftrace_pre_boundary_failure_preserves_duckdb_status(self):
+        completed, run_dir, _, _ = self.run_bpftrace_tool(
+            b"SELECT FAIL_QUERY;\n",
+            run_name="bpftrace-pre-boundary",
+            extra_env={"FAKE_BPFTRACE_NO_BOUNDARY": "1"},
+        )
+        self.assertEqual(completed.returncode, 7, completed.stderr)
+        metadata = json.loads(
+            (run_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertIsNone(metadata["infrastructure_error"])
+        self.assertIn("never observed", metadata["boundary_warning"])
+        self.assertEqual(metadata["effective_exit_status"], 7)
+
+    def test_bpftrace_timeout_returns_124_and_keeps_artifacts(self):
+        completed, run_dir, _, _ = self.run_bpftrace_tool(
+            b"SELECT SLOW_QUERY;\n",
+            run_name="bpftrace-timeout",
+            extra=["--timeout", "0.1"],
+        )
+        self.assertEqual(completed.returncode, 124, completed.stderr)
+        self.assertTrue((run_dir / "raw.bpftrace.jsonl").stat().st_size)
+        metadata = json.loads(
+            (run_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(metadata["timed_out"])
+        self.assertEqual(metadata["effective_exit_status"], 124)
+
+    def test_interrupt_kills_bpftrace_target_process_group(self):
+        run_dir = self.root / "bpftrace-interrupt"
+        capture = self.root / "bpftrace-interrupt-sql.bin"
+        argv_capture = self.root / "bpftrace-interrupt-argv.json"
+        pid_capture = self.root / "bpftrace-interrupt-pid.txt"
+        env = os.environ.copy()
+        env["FAKE_SQL_CAPTURE"] = str(capture)
+        env["FAKE_ARGV_CAPTURE"] = str(argv_capture)
+        env["FAKE_PID_CAPTURE"] = str(pid_capture)
+        env["PATH"] = "{}{}{}".format(
+            self.fake_bin, os.pathsep, env.get("PATH", "")
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--backend",
+                "bpftrace",
+                "--scope",
+                "query",
+                "--duckdb",
+                str(self.duckdb),
+                "--tracer",
+                str(self.bpftrace),
+                "--output-dir",
+                str(run_dir),
+                "--sql",
+                "SELECT SLOW_QUERY;",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        deadline = time.monotonic() + 5
+        while not pid_capture.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(pid_capture.exists(), "fake DuckDB did not start")
+        target_pid = int(pid_capture.read_text(encoding="utf-8"))
+        process.send_signal(signal.SIGINT)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 130, stderr)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(target_pid, 0)
 
     def test_dtrace_target_permission_error_preserves_query_status(self):
         completed, run_dir, _, _ = self.run_dtrace_tool(

@@ -49,6 +49,8 @@ python3 scripts/trace_duckdb_syscalls.py \
   --sql 'SELECT 42;'
 ```
 
-macOS query/engine scope uses symbol-resolved DTrace probes; Linux process scope
-uses `strace`. See [the tracing guide](scripts/trace_duckdb_syscalls.md) for
-scope semantics, permissions, artifacts, security considerations, and tests.
+macOS query/engine scope uses symbol-resolved DTrace probes. Linux process scope
+uses `strace`, while explicit query/engine scope uses bpftrace uprobes plus
+raw-syscall tracepoints. See
+[the tracing guide](scripts/trace_duckdb_syscalls.md) for scope semantics,
+permissions, artifacts, security considerations, and tests.
