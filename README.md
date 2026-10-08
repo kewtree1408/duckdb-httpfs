@@ -36,3 +36,19 @@ Some tests querying remote resources can be run already without further setup:
 ./build/release/test/unittest
 ```
 Further integration testing uses a local MinIO setup using Docker. See the [testing documentation for more information on how to set this up locally](test).
+
+## Tracing DuckDB system calls
+
+The repository includes a cross-platform tracing helper for running arbitrary
+SQL against the local DuckDB shell:
+
+```console
+python3 scripts/trace_duckdb_syscalls.py \
+  --duckdb build/release/duckdb \
+  --scope process \
+  --sql 'SELECT 42;'
+```
+
+macOS query/engine scope uses symbol-resolved DTrace probes; Linux process scope
+uses `strace`. See [the tracing guide](scripts/trace_duckdb_syscalls.md) for
+scope semantics, permissions, artifacts, security considerations, and tests.
