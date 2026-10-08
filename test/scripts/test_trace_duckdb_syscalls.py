@@ -369,6 +369,8 @@ class BoundaryTests(unittest.TestCase):
             program,
             re.compile(r'printf\([^\n]*"\s*\n\s*"'),
         )
+        self.assertIn('\\"ts_ns\\":%lld', program)
+        self.assertNotIn('\\"ts_ns\\":%llu', program)
 
     def test_process_program_starts_active_and_has_no_boundary_probe(self):
         program = TRACE.build_dtrace_program("process", [], False)

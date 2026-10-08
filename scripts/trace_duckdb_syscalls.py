@@ -786,14 +786,14 @@ def build_dtrace_program(
 {{
     boundary_depth[$target] = boundary_depth[$target] + 1;
     active[$target] = 1;
-    printf("{{\\\"type\\\":\\\"boundary\\\",\\\"phase\\\":\\\"entry\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%llu,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"depth\\\":%d}}\\n",
+    printf("{{\\\"type\\\":\\\"boundary\\\",\\\"phase\\\":\\\"entry\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"depth\\\":%d}}\\n",
         walltimestamp, pid, tid, boundary_depth[$target]);
 }}
 
 {return_probes}
 /boundary_depth[$target] > 0/
 {{
-    printf("{{\\\"type\\\":\\\"boundary\\\",\\\"phase\\\":\\\"return\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%llu,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"depth\\\":%d}}\\n",
+    printf("{{\\\"type\\\":\\\"boundary\\\",\\\"phase\\\":\\\"return\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"depth\\\":%d}}\\n",
         walltimestamp, pid, tid, boundary_depth[$target]);
     boundary_depth[$target] = boundary_depth[$target] - 1;
     active[$target] = boundary_depth[$target] > 0;
@@ -810,7 +810,7 @@ dtrace:::BEGIN
 {{
     active[$target] = {initial_active};
     boundary_depth[$target] = 0;
-    printf("{{\\\"type\\\":\\\"trace_start\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%llu,\\\"target_pid\\\":%d}}\\n",
+    printf("{{\\\"type\\\":\\\"trace_start\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%lld,\\\"target_pid\\\":%d}}\\n",
         walltimestamp, $target);
 }}
 
@@ -826,7 +826,7 @@ syscall:::entry
     self->syscall_arg3 = arg3;
     self->syscall_arg4 = arg4;
     self->syscall_arg5 = arg5;
-    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"entry\\\",\\\"provider\\\":\\\"syscall\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%llu,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"args\\\":[%lld,%lld,%lld,%lld,%lld,%lld]}}\\n",
+    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"entry\\\",\\\"provider\\\":\\\"syscall\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"args\\\":[%lld,%lld,%lld,%lld,%lld,%lld]}}\\n",
         probefunc, walltimestamp, pid, tid,
         self->syscall_arg0, self->syscall_arg1, self->syscall_arg2,
         self->syscall_arg3, self->syscall_arg4, self->syscall_arg5);
@@ -836,7 +836,7 @@ syscall:::return
 /self->syscall_started/
 {{
     this->elapsed = timestamp - self->syscall_started;
-    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"return\\\",\\\"provider\\\":\\\"syscall\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%llu,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"return\\\":%lld,\\\"error\\\":%d,\\\"duration_ns\\\":%llu}}\\n",
+    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"return\\\",\\\"provider\\\":\\\"syscall\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"return\\\":%lld,\\\"error\\\":%d,\\\"duration_ns\\\":%llu}}\\n",
         probefunc, walltimestamp, pid, tid, arg0, errno, this->elapsed);
     self->syscall_started = 0;
 }}
@@ -851,7 +851,7 @@ mach_trap:::entry
     self->mach_arg3 = arg3;
     self->mach_arg4 = arg4;
     self->mach_arg5 = arg5;
-    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"entry\\\",\\\"provider\\\":\\\"mach_trap\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%llu,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"args\\\":[%lld,%lld,%lld,%lld,%lld,%lld]}}\\n",
+    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"entry\\\",\\\"provider\\\":\\\"mach_trap\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"args\\\":[%lld,%lld,%lld,%lld,%lld,%lld]}}\\n",
         probefunc, walltimestamp, pid, tid,
         self->mach_arg0, self->mach_arg1, self->mach_arg2,
         self->mach_arg3, self->mach_arg4, self->mach_arg5);
@@ -861,7 +861,7 @@ mach_trap:::return
 /self->mach_started/
 {{
     this->elapsed = timestamp - self->mach_started;
-    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"return\\\",\\\"provider\\\":\\\"mach_trap\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%llu,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"return\\\":%lld,\\\"error\\\":null,\\\"duration_ns\\\":%llu}}\\n",
+    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"return\\\",\\\"provider\\\":\\\"mach_trap\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"return\\\":%lld,\\\"error\\\":null,\\\"duration_ns\\\":%llu}}\\n",
         probefunc, walltimestamp, pid, tid, arg0, this->elapsed);
     self->mach_started = 0;
 }}
@@ -869,19 +869,19 @@ mach_trap:::return
 syscall::exit:entry
 /pid == $target/
 {{
-    printf("{{\\\"type\\\":\\\"process_exit\\\",\\\"ts_ns\\\":%llu,\\\"pid\\\":%d,\\\"status\\\":%d}}\\n",
+    printf("{{\\\"type\\\":\\\"process_exit\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"status\\\":%d}}\\n",
         walltimestamp, pid, arg0);
 }}
 
 dtrace:::ERROR
 {{
-    printf("{{\\\"type\\\":\\\"dtrace_error\\\",\\\"ts_ns\\\":%llu}}\\n",
+    printf("{{\\\"type\\\":\\\"dtrace_error\\\",\\\"ts_ns\\\":%lld}}\\n",
         walltimestamp);
 }}
 
 dtrace:::END
 {{
-    printf("{{\\\"type\\\":\\\"trace_end\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%llu,\\\"target_pid\\\":%d}}\\n",
+    printf("{{\\\"type\\\":\\\"trace_end\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%lld,\\\"target_pid\\\":%d}}\\n",
         walltimestamp, $target);
 }}
 """.format(
