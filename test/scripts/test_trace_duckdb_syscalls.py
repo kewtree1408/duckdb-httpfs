@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shlex
 import signal
 import subprocess
@@ -364,6 +365,10 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("mach_trap:::return", program)
         self.assertIn('"type\\":\\"boundary', program)
         self.assertNotIn("self->active", program)
+        self.assertNotRegex(
+            program,
+            re.compile(r'printf\([^\n]*"\s*\n\s*"'),
+        )
 
     def test_process_program_starts_active_and_has_no_boundary_probe(self):
         program = TRACE.build_dtrace_program("process", [], False)
