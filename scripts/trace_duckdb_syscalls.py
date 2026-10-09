@@ -5,34 +5,45 @@ from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import ctypes
 import ctypes.util
 import datetime
+import functools
 import hashlib
+import io
 import json
 import os
 import pathlib
 import platform
 import re
-import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import uuid
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from xml.etree import ElementTree
 
 
-TOOL_VERSION = "1.1"
+TOOL_VERSION = "2.1"
 DEFAULT_DUCKDB = "build/release/duckdb"
 DEFAULT_DATABASE = ":memory:"
-DEFAULT_BUFFER_SIZE = "16m"
 DEFAULT_STRING_LIMIT = 4096
+DEFAULT_TEMPLATE = "File Activity"
+# Xcode 27 dropped the System Trace template, so File Activity is the only
+# stock template that records BSD syscalls. Despite the name it also covers the
+# socket calls (socket/connect/sendto/recvfrom) that httpfs work depends on.
+FSSYSCALL_SCHEMA = "FsSyscall"
+XCTRACE_ATTACH_TIMEOUT = 120.0
+XCTRACE_SAVE_TIMEOUT = 180.0
 TIMEOUT_EXIT_STATUS = 124
 TOOL_ERROR_STATUS = 2
-
-BUFFER_SIZE_RE = re.compile(r"^[1-9][0-9]*[kmgtKMGT]?$")
+# DuckDB flags that carry SQL text in argv. Accepting them would put the query
+# in the process table and leave query_sha256 describing only part of what ran.
+SQL_BEARING_DUCKDB_FLAGS = frozenset(("-c", "-cmd", "-s"))
 STRACE_COMPLETE_RE = re.compile(
     r"^(?:(?:\[pid\s+)?(?P<pid>[0-9]+)\]?\s+)?"
     r"(?P<timestamp>[0-9]+\.[0-9]+)\s+"
@@ -45,6 +56,95 @@ STRACE_RESUMED_RE = re.compile(
     r"<\.\.\.\s+(?P<call>[A-Za-z_][A-Za-z0-9_]*)\s+resumed>.*\s+=\s+"
     r"(?P<result>.*?)\s+<(?P<duration>[0-9]+\.[0-9]+)>$"
 )
+SYSCALL_CATEGORIES = {
+    "Network and sockets": (
+        "accept accept4 bind connect getsockname getpeername getsockopt "
+        "listen necp_client_action necp_open recv recvfrom recvmsg recvmmsg "
+        "send sendmsg sendmmsg sendto setsockopt shutdown socket"
+    ).split(),
+    "File and descriptor I/O": (
+        "change_fdguard_np close close_range dup dup2 dup3 fcntl fdatasync "
+        "flock fsync ftruncate ftruncate64 ioctl lseek open openat openat2 "
+        "creat pread pread64 preadv preadv2 pwrite pwrite64 pwritev pwritev2 "
+        "read readv write writev sendfile sendfile64 copy_file_range "
+        "splice tee vmsplice fallocate truncate truncate64"
+    ).split(),
+    "Thread synchronization": (
+        "psynch_cvbroad psynch_cvsignal psynch_cvwait psynch_mutexdrop "
+        "psynch_mutexwait psynch_rw_rdlock psynch_rw_unlock psynch_rw_wrlock "
+        "semaphore_signal_trap semaphore_wait_trap semaphore_timedwait_trap "
+        "semaphore_wait_signal_trap semaphore_timedwait_signal_trap "
+        "ulock_wait ulock_wait2 ulock_wake futex futex_time64 futex_waitv "
+        "futex_wait futex_wake futex_requeue set_robust_list get_robust_list"
+    ).split(),
+    "I/O readiness and event notification": (
+        "kevent kevent_id kevent_qos kqueue poll ppoll ppoll_time64 select "
+        "pselect6 pselect6_time64 epoll_create epoll_create1 epoll_ctl "
+        "epoll_wait epoll_pwait epoll_pwait2 eventfd eventfd2 "
+        "io_uring_setup io_uring_enter io_uring_register "
+        "io_setup io_destroy io_submit io_cancel io_getevents io_pgetevents"
+    ).split(),
+    "Virtual and shared memory": (
+        "mach_vm_allocate_trap mach_vm_deallocate_trap mach_vm_map_trap "
+        "mach_vm_protect_trap map_with_linking_np shared_region_check_np "
+        "mmap mmap2 mprotect munmap mremap brk madvise msync mincore "
+        "mlock mlock2 munlock mlockall munlockall "
+        "shm_open shm_unlink shmget shmat shmdt shmctl memfd_create "
+        "memfd_secret process_madvise"
+    ).split(),
+    "Thread lifecycle and workqueues": (
+        "bsdthread_create bsdthread_ctl bsdthread_register disable_threadsignal "
+        "gettid thread_selfid workq_kernreturn workq_open set_tid_address rseq "
+        "sched_yield sched_getaffinity sched_setaffinity sched_getparam "
+        "sched_setparam sched_getscheduler sched_setscheduler"
+    ).split(),
+    "IPC, Mach ports and activity context": (
+        "host_create_mach_voucher_trap host_self_trap mach_generate_activity_id "
+        "mach_msg_trap mach_msg_overwrite_trap mach_msg2_trap "
+        "mach_port_construct_trap mach_port_deallocate_trap mach_port_destruct_trap "
+        "mach_port_mod_refs_trap mach_port_request_notification_trap "
+        "mach_reply_port task_self_trap thread_get_special_reply_port "
+        "pipe pipe2 socketpair msgget msgsnd msgrcv msgctl "
+        "semget semop semtimedop semctl"
+    ).split(),
+    "Filesystem metadata and discovery": (
+        "access faccessat faccessat2 fgetattrlist fsgetpath fstatat64 "
+        "fstatfs64 getattrlist getdirentries64 getfsstat64 stat64 fstat64 "
+        "lstat64 stat fstat lstat newfstatat statx statfs fstatfs "
+        "getdents getdents64 getcwd chdir fchdir readlink readlinkat "
+        "getxattr fgetxattr lgetxattr listxattr flistxattr llistxattr "
+        "mkdir mkdirat rmdir unlink unlinkat rename renameat renameat2 "
+        "link linkat symlink symlinkat chmod fchmod fchmodat "
+        "chown fchown lchown fchownat utime utimes utimensat"
+    ).split(),
+    "Process identity, system information and signals": (
+        "getegid geteuid getgid getpid getppid getpgrp getpgid getsid getrlimit "
+        "getuid getresuid getresgid getgroups prlimit64 setrlimit getrusage "
+        "proc_info sysctl sysinfo uname sigaction rt_sigaction sigprocmask "
+        "rt_sigprocmask rt_sigreturn sigaltstack kill tkill tgkill"
+    ).split(),
+    "Security, tracing and platform support": (
+        "csops csops_audittoken csrctl getentropy getrandom issetugid "
+        "kdebug_typefilter mac_syscall crossarch_trap arch_prctl prctl "
+        "seccomp capget capset ptrace"
+    ).split(),
+    "Time and clock information": (
+        "gettimeofday mach_timebase_info clock_gettime clock_gettime64 "
+        "clock_getres clock_getres_time64 nanosleep clock_nanosleep "
+        "clock_nanosleep_time64 time times getitimer setitimer alarm "
+        "timerfd_create timerfd_settime timerfd_gettime"
+    ).split(),
+    "Process lifecycle": (
+        "clone clone3 fork vfork execve execveat exit exit_group wait4 waitid "
+        "pidfd_open pidfd_getfd pidfd_send_signal"
+    ).split(),
+}
+SYSCALL_CATEGORY_BY_NAME = {
+    name: category
+    for category, names in SYSCALL_CATEGORIES.items()
+    for name in names
+}
+UNCLASSIFIED_CATEGORY = "Other / unclassified"
 
 
 class TraceError(Exception):
@@ -75,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run DuckDB with SQL from an argument, file, or stdin and write a "
-            "syscall trace, summary, and metadata."
+            "syscall trace, summary, classification reports, and metadata."
         )
     )
     parser.add_argument(
@@ -87,6 +187,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--database",
         default=DEFAULT_DATABASE,
         help="database path or DuckDB connection string (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--duckdb-arg",
+        dest="duckdb_args",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help=(
+            "extra DuckDB command-line argument, repeated once per argument; "
+            "use the equals form for values that start with a dash "
+            "(--duckdb-arg=-unsigned), or pass them after a -- separator"
+        ),
     )
     sql_group = parser.add_mutually_exclusive_group()
     sql_group.add_argument("--sql", help="SQL text; passed to DuckDB over stdin")
@@ -100,25 +212,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         choices=("query", "engine", "process"),
         help=(
-            "trace boundary; defaults to query with DTrace/bpftrace and process "
-            "with strace"
+            "trace boundary; defaults to query with xctrace/bpftrace and "
+            "process with strace"
         ),
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "dtrace", "strace", "bpftrace"),
+        choices=("auto", "xctrace", "strace", "bpftrace"),
         default="auto",
         help=(
-            "tracing backend (default: DTrace on macOS; strace for Linux process "
-            "scope and bpftrace for explicit Linux query/engine scope)"
+            "tracing backend (default: xctrace on macOS; strace for Linux "
+            "process scope and bpftrace for explicit Linux query/engine scope)"
         ),
     )
     parser.add_argument(
         "--tracer",
         help=(
-            "path to dtrace, strace, or bpftrace "
+            "path to xctrace, strace, or bpftrace "
             "(mainly useful for nonstandard installs)"
         ),
+    )
+    parser.add_argument(
+        "--template",
+        default=DEFAULT_TEMPLATE,
+        help="xctrace recording template (default: %(default)s)",
     )
     parser.add_argument(
         "--output-dir",
@@ -130,30 +247,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-summary",
         action="store_true",
-        help="do not write a human-readable summary",
+        help="omit summary.txt (classification reports are still written)",
     )
     parser.add_argument(
         "--children",
         dest="children",
         action="store_true",
-        default=True,
-        help="include descendant processes (default)",
+        default=None,
+        help="include descendant processes (default on strace and bpftrace)",
     )
     parser.add_argument(
         "--no-children",
         dest="children",
         action="store_false",
-        help="exclude descendant processes (DTrace only; threads remain included)",
+        help="exclude descendant processes (threads remain included)",
     )
     parser.add_argument(
         "--timeout",
         type=float,
         help="terminate the trace after this many seconds",
-    )
-    parser.add_argument(
-        "--buffer-size",
-        default=DEFAULT_BUFFER_SIZE,
-        help="DTrace principal/dynamic buffer size (default: %(default)s)",
     )
     parser.add_argument(
         "--string-limit",
@@ -169,14 +281,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def split_passthrough(
+    argv: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    values = list(argv)
+    if "--" not in values:
+        return values, []
+    separator = values.index("--")
+    return values[:separator], values[separator + 1 :]
+
+
+def validate_duckdb_args(values: Sequence[str]) -> None:
+    for value in values:
+        if value.split("=", 1)[0] in SQL_BEARING_DUCKDB_FLAGS:
+            raise TraceError(
+                "{} puts SQL on the DuckDB command line, where it is visible to "
+                "other processes and absent from query_sha256; supply SQL with "
+                "--sql, --sql-file, or stdin".format(value.split("=", 1)[0])
+            )
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    args = build_parser().parse_args(argv)
+    options, passthrough = split_passthrough(
+        sys.argv[1:] if argv is None else argv
+    )
+    args = build_parser().parse_args(options)
+    args.duckdb_args = list(args.duckdb_args) + passthrough
+    validate_duckdb_args(args.duckdb_args)
     if args.timeout is not None and args.timeout <= 0:
         raise TraceError("--timeout must be greater than zero")
-    if not BUFFER_SIZE_RE.fullmatch(args.buffer_size):
-        raise TraceError(
-            "--buffer-size must be a positive integer with an optional k, m, g, or t suffix"
-        )
+    if not args.template.strip():
+        raise TraceError("--template must not be empty")
     if args.string_limit <= 0:
         raise TraceError("--string-limit must be greater than zero")
     if args.no_summary and args.summary:
@@ -241,7 +376,7 @@ def select_backend(
         return requested
     host = system_name if system_name is not None else platform.system()
     if host == "Darwin":
-        return "dtrace"
+        return "xctrace"
     if host == "Linux":
         if scope in ("query", "engine"):
             return "bpftrace"
@@ -254,7 +389,19 @@ def select_backend(
 def select_scope(requested: Optional[str], backend: str) -> str:
     if requested:
         return requested
-    return "query" if backend in ("dtrace", "bpftrace") else "process"
+    return "query" if backend in ("xctrace", "bpftrace") else "process"
+
+
+def select_children(requested: Optional[bool], backend: str) -> bool:
+    if backend == "xctrace":
+        if requested:
+            raise TraceError(
+                "--children is not available with xctrace: the recording "
+                "attaches to one process and does not follow descendants; "
+                "every thread of that process is always included"
+            )
+        return False
+    return True if requested is None else requested
 
 
 def make_artifact_paths(
@@ -272,8 +419,8 @@ def make_artifact_paths(
         while output_dir.exists():
             output_dir = pathlib.Path("{}-{}".format(base, suffix))
             suffix += 1
-    if backend == "dtrace":
-        raw_name = "raw.dtrace.jsonl"
+    if backend == "xctrace":
+        raw_name = "raw.xctrace.jsonl"
     elif backend == "bpftrace":
         raw_name = "raw.bpftrace.jsonl"
     else:
@@ -294,14 +441,11 @@ def make_artifact_paths(
         if args.metadata
         else output_dir / "metadata.json",
         "program": (
-            output_dir / "dtrace-program.d"
-            if backend == "dtrace"
-            else (
-                output_dir / "bpftrace-program.bt"
-                if backend == "bpftrace"
-                else None
-            )
+            output_dir / "bpftrace-program.bt" if backend == "bpftrace" else None
         ),
+        "bundle": output_dir / "recording.trace" if backend == "xctrace" else None,
+        "classification_report": output_dir / "syscall-categories.md",
+        "classification_csv": output_dir / "syscall-categories.csv",
     }
     artifacts = [
         path
@@ -310,7 +454,7 @@ def make_artifact_paths(
     ]
     if len({str(path) for path in artifacts}) != len(artifacts):
         raise TraceError(
-            "raw trace, summary, metadata, and tracer program paths must differ"
+            "artifact paths must differ"
         )
     for path in artifacts:
         if path.exists():
@@ -337,8 +481,10 @@ def command_version(command: Sequence[str]) -> Optional[str]:
     return output.splitlines()[0] if output else None
 
 
-def duckdb_command(binary: str, database: str) -> List[str]:
-    return [binary, "--no-init", "--batch", "--bail", database]
+def duckdb_command(
+    binary: str, database: str, extra_args: Sequence[str] = ()
+) -> List[str]:
+    return [binary, database, "--no-init", "--batch", "--bail", *extra_args]
 
 
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -672,7 +818,7 @@ def parse_nm_symbols(output: str) -> List[str]:
     return symbols
 
 
-def run_nm(binary: str) -> List[str]:
+def run_nm(binary: str) -> Iterator[List[str]]:
     nm = shutil.which("nm")
     if not nm:
         raise TraceError("nm is required to resolve DuckDB query-boundary symbols")
@@ -686,6 +832,7 @@ def run_nm(binary: str) -> List[str]:
             [nm, binary],
         ]
     diagnostics: List[str] = []
+    found_symbols = False
     for command in commands:
         try:
             completed = subprocess.run(
@@ -701,10 +848,13 @@ def run_nm(binary: str) -> List[str]:
         if completed.returncode == 0:
             symbols = parse_nm_symbols(completed.stdout.decode("utf-8", "replace"))
             if symbols:
-                return symbols
+                found_symbols = True
+                yield symbols
         diagnostic = completed.stderr.decode("utf-8", "replace").strip()
         if diagnostic:
             diagnostics.append(diagnostic)
+    if found_symbols:
+        return
     detail = "; ".join(diagnostics[-2:]) if diagnostics else "no symbols found"
     raise TraceError("could not read symbols from {}: {}".format(binary, detail))
 
@@ -744,152 +894,451 @@ def boundary_marker(scope: str) -> str:
 
 
 def resolve_boundary_symbols(binary: str, scope: str) -> List[Tuple[str, str]]:
-    symbols = run_nm(binary)
-    demangled = demangle_symbols(symbols)
     marker = boundary_marker(scope)
-    matches = [
-        (symbol, readable)
-        for symbol, readable in zip(symbols, demangled)
-        if marker in readable
-    ]
-    if not matches:
+    for symbols in run_nm(binary):
+        demangled = demangle_symbols(symbols)
+        matches = [
+            (symbol, readable)
+            for symbol, readable in zip(symbols, demangled)
+            if marker in readable
+        ]
+        if matches:
+            return matches
+    raise TraceError(
+        "DuckDB binary does not contain a symbol matching {!r}; "
+        "use --scope process or build an unstripped shell with that symbol".format(
+            marker[:-1]
+        )
+    )
+
+
+def xctrace_templates(tracer: str) -> List[str]:
+    try:
+        completed = subprocess.run(
+            [tracer, "list", "templates"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TraceError("cannot list xctrace templates: {}".format(exc)) from exc
+    output = completed.stdout.decode("utf-8", "replace")
+    if completed.returncode != 0:
         raise TraceError(
-            "DuckDB binary does not export a symbol matching {!r}; "
-            "use --scope process or build an unstripped shell with that symbol".format(
-                marker[:-1]
+            "xctrace could not list templates: {}".format(output.strip())
+        )
+    names = []
+    for line in output.splitlines():
+        name = line.strip()
+        if name and not name.startswith("=="):
+            names.append(name)
+    return names
+
+
+def ensure_xctrace_template(tracer: str, template: str) -> None:
+    available = xctrace_templates(tracer)
+    if template in available:
+        return
+    raise TraceError(
+        "xctrace template {!r} is unavailable. Recording needs a full Xcode "
+        "installation rather than the Command Line Tools alone. Available "
+        "templates: {}".format(template, ", ".join(available) or "none")
+    )
+
+
+def build_xctrace_record_command(
+    tracer: str,
+    template: str,
+    bundle_path: pathlib.Path,
+    target_pid: int,
+) -> List[str]:
+    return [
+        tracer,
+        "record",
+        "--template",
+        template,
+        "--output",
+        str(bundle_path),
+        "--no-prompt",
+        "--attach",
+        str(target_pid),
+    ]
+
+
+def build_xctrace_export_command(
+    tracer: str, bundle_path: pathlib.Path, schema: str = FSSYSCALL_SCHEMA
+) -> List[str]:
+    return [
+        tracer,
+        "export",
+        "--input",
+        str(bundle_path),
+        "--xpath",
+        '/trace-toc/run[@number="1"]/data/table[@schema="{}"]'.format(schema),
+    ]
+
+
+def sql_string_literal(value: str) -> str:
+    return "'{}'".format(value.replace("'", "''"))
+
+
+def marker_paths(
+    output_dir: pathlib.Path, nonce: str
+) -> Tuple[pathlib.Path, pathlib.Path]:
+    return (
+        output_dir / "marker-begin-{}.csv".format(nonce),
+        output_dir / "marker-end-{}.csv".format(nonce),
+    )
+
+
+def write_marker_files(begin: pathlib.Path, end: pathlib.Path) -> None:
+    for path in (begin, end):
+        path.write_bytes(b"duckdb_trace_marker\n1\n")
+
+
+def wrap_sql_with_markers(
+    sql: bytes, begin: pathlib.Path, end: pathlib.Path
+) -> bytes:
+    def read_marker(path: pathlib.Path) -> bytes:
+        return "SELECT * FROM read_csv({});\n".format(
+            sql_string_literal(str(path))
+        ).encode("utf-8")
+
+    separator = b"" if not sql or sql.endswith(b"\n") else b"\n"
+    return read_marker(begin) + sql + separator + read_marker(end)
+
+
+def find_marker_window(
+    rows: Sequence[Dict[str, Any]], nonce: str
+) -> Optional[Tuple[int, int]]:
+    def timestamps(prefix: str) -> List[int]:
+        needle = "marker-{}-{}".format(prefix, nonce)
+        return [
+            row["start_ns"]
+            for row in rows
+            if row["path"] and needle in row["path"]
+        ]
+
+    begins = timestamps("begin")
+    ends = timestamps("end")
+    if not begins or not ends:
+        return None
+    return min(begins), max(ends)
+
+
+def parse_fssyscall_xml(payload: bytes) -> List[Dict[str, Any]]:
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError as exc:
+        raise TraceError(
+            "could not parse the xctrace export: {}".format(exc)
+        ) from exc
+
+    # The exporter writes each distinct value once with an id attribute and
+    # refers to every later occurrence by ref, so reading a column means
+    # following those back-references.
+    catalogue = {
+        element.get("id"): element for element in root.iter() if element.get("id")
+    }
+
+    def resolve(element: Any) -> Any:
+        if element is None:
+            return None
+        reference = element.get("ref")
+        return catalogue.get(reference) if reference else element
+
+    def column(parent: Any, tag: str) -> Any:
+        return resolve(parent.find(tag)) if parent is not None else None
+
+    def number(element: Any) -> Optional[int]:
+        if element is None or not element.text:
+            return None
+        try:
+            return int(element.text)
+        except ValueError:
+            return None
+
+    rows: List[Dict[str, Any]] = []
+    for row in root.findall(".//row"):
+        start = number(column(row, "start-time"))
+        if start is None:
+            continue
+        syscall = column(row, "syscall")
+        path = column(row, "file-path")
+        rows.append(
+            {
+                "start_ns": start,
+                "duration_ns": number(column(row, "duration")) or 0,
+                "call": syscall.get("fmt") if syscall is not None else "unknown",
+                "return": number(column(row, "syscall-return")),
+                "pid": number(column(column(row, "process"), "pid")),
+                "tid": number(column(column(row, "thread"), "tid")),
+                "path": path.get("fmt") if path is not None else None,
+            }
+        )
+    rows.sort(key=lambda row: row["start_ns"])
+    return rows
+
+
+def export_fssyscall_rows(
+    tracer: str, bundle_path: pathlib.Path
+) -> List[Dict[str, Any]]:
+    command = build_xctrace_export_command(tracer, bundle_path)
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=900,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TraceError(
+            "cannot export the xctrace recording: {}".format(exc)
+        ) from exc
+    if completed.returncode != 0:
+        raise TraceError(
+            "xctrace export failed: {}".format(
+                completed.stderr.decode("utf-8", "replace").strip()
             )
         )
-    return matches
+    return parse_fssyscall_xml(completed.stdout)
 
 
-def dtrace_probe_list(symbols: Sequence[str], probe: str) -> str:
-    return ",\n".join(
-        "pid$target::{}:{}".format(symbol, probe) for symbol in symbols
-    )
+def write_xctrace_jsonl(
+    rows: Sequence[Dict[str, Any]],
+    raw_path: pathlib.Path,
+    scope: str,
+    window: Optional[Tuple[int, int]],
+    target_pid: Optional[int],
+) -> None:
+    first = rows[0]["start_ns"] if rows else 0
+    last = rows[-1]["start_ns"] if rows else 0
+    with raw_path.open("w", encoding="utf-8") as handle:
+        def emit(event: Dict[str, Any]) -> None:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
 
+        def boundary(phase: str, timestamp: int) -> None:
+            emit(
+                {
+                    "type": "boundary",
+                    "phase": phase,
+                    "scope": scope,
+                    "ts_ns": timestamp,
+                    "pid": target_pid,
+                    "tid": None,
+                    "depth": 1,
+                }
+            )
 
-def build_dtrace_program(
-    scope: str, symbols: Sequence[str], include_children: bool
-) -> str:
-    subject = (
-        "(pid == $target || progenyof($target))"
-        if include_children
-        else "pid == $target"
-    )
-    boundary = ""
-    initial_active = 1 if scope == "process" else 0
-    if scope != "process":
-        entry_probes = dtrace_probe_list(symbols, "entry")
-        return_probes = dtrace_probe_list(symbols, "return")
-        boundary = """
-{entry_probes}
-{{
-    boundary_depth[$target] = boundary_depth[$target] + 1;
-    active[$target] = 1;
-    printf("{{\\\"type\\\":\\\"boundary\\\",\\\"phase\\\":\\\"entry\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"depth\\\":%d}}\\n",
-        walltimestamp, pid, tid, boundary_depth[$target]);
-}}
-
-{return_probes}
-/boundary_depth[$target] > 0/
-{{
-    printf("{{\\\"type\\\":\\\"boundary\\\",\\\"phase\\\":\\\"return\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"depth\\\":%d}}\\n",
-        walltimestamp, pid, tid, boundary_depth[$target]);
-    boundary_depth[$target] = boundary_depth[$target] - 1;
-    active[$target] = boundary_depth[$target] > 0;
-}}
-""".format(
-            entry_probes=entry_probes,
-            return_probes=return_probes,
-            scope=scope,
+        emit(
+            {
+                "type": "trace_start",
+                "scope": scope,
+                "ts_ns": first,
+                "target_pid": target_pid,
+            }
+        )
+        if window is not None:
+            boundary("entry", window[0])
+        for row in rows:
+            if window is not None and not window[0] <= row["start_ns"] <= window[1]:
+                continue
+            shared = {
+                "type": "call",
+                "provider": "syscall",
+                "call": row["call"],
+                "pid": row["pid"],
+                "tid": row["tid"],
+            }
+            emit(dict(shared, phase="entry", ts_ns=row["start_ns"], path=row["path"]))
+            returned = row["return"]
+            emit(
+                dict(
+                    shared,
+                    phase="return",
+                    ts_ns=row["start_ns"] + row["duration_ns"],
+                    duration_ns=row["duration_ns"],
+                    # FsSyscall has no errno column, so a negative return is
+                    # the only available error signal.
+                    error=1 if returned is not None and returned < 0 else 0,
+                    **{"return": returned},
+                )
+            )
+        if window is not None:
+            boundary("return", window[1])
+        emit(
+            {
+                "type": "trace_end",
+                "scope": scope,
+                "ts_ns": last,
+                "target_pid": target_pid,
+            }
         )
 
-    return """#pragma D option quiet
 
-dtrace:::BEGIN
-{{
-    active[$target] = {initial_active};
-    boundary_depth[$target] = 0;
-    printf("{{\\\"type\\\":\\\"trace_start\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%lld,\\\"target_pid\\\":%d}}\\n",
-        walltimestamp, $target);
-}}
+def pump_xctrace_output(
+    stream: Any, chunks: List[bytes], ready: threading.Event
+) -> None:
+    for line in iter(stream.readline, b""):
+        chunks.append(line)
+        if b"Ctrl-C to stop" in line:
+            ready.set()
+    stream.close()
 
-{boundary}
 
-syscall:::entry
-/active[$target] && ({subject})/
-{{
-    self->syscall_started = timestamp;
-    self->syscall_arg0 = arg0;
-    self->syscall_arg1 = arg1;
-    self->syscall_arg2 = arg2;
-    self->syscall_arg3 = arg3;
-    self->syscall_arg4 = arg4;
-    self->syscall_arg5 = arg5;
-    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"entry\\\",\\\"provider\\\":\\\"syscall\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"args\\\":[%lld,%lld,%lld,%lld,%lld,%lld]}}\\n",
-        probefunc, walltimestamp, pid, tid,
-        self->syscall_arg0, self->syscall_arg1, self->syscall_arg2,
-        self->syscall_arg3, self->syscall_arg4, self->syscall_arg5);
-}}
+def run_xctrace(
+    tracer: str,
+    template: str,
+    bundle_path: pathlib.Path,
+    target: Sequence[str],
+    sql: bytes,
+    timeout: Optional[float],
+    suppress_stdout: bool,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, Optional[int], bytes, bool]:
+    stdout = subprocess.DEVNULL if suppress_stdout else None
+    launcher = [sys.executable, "-c", PAUSED_EXEC_CODE, *target]
+    try:
+        target_process = subprocess.Popen(
+            launcher,
+            stdin=subprocess.PIPE,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise TraceError("cannot start DuckDB launcher: {}".format(exc)) from exc
 
-syscall:::return
-/self->syscall_started/
-{{
-    this->elapsed = timestamp - self->syscall_started;
-    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"return\\\",\\\"provider\\\":\\\"syscall\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"return\\\":%lld,\\\"error\\\":%d,\\\"duration_ns\\\":%llu}}\\n",
-        probefunc, walltimestamp, pid, tid, arg0, errno, this->elapsed);
-    self->syscall_started = 0;
-}}
+    tracer_process: Optional[subprocess.Popen[bytes]] = None
+    target_stderr = b""
+    tracer_chunks: List[bytes] = []
+    output_thread: Optional[threading.Thread] = None
+    previous_signal_handlers: Dict[int, Any] = {}
 
-mach_trap:::entry
-/active[$target] && ({subject})/
-{{
-    self->mach_started = timestamp;
-    self->mach_arg0 = arg0;
-    self->mach_arg1 = arg1;
-    self->mach_arg2 = arg2;
-    self->mach_arg3 = arg3;
-    self->mach_arg4 = arg4;
-    self->mach_arg5 = arg5;
-    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"entry\\\",\\\"provider\\\":\\\"mach_trap\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"args\\\":[%lld,%lld,%lld,%lld,%lld,%lld]}}\\n",
-        probefunc, walltimestamp, pid, tid,
-        self->mach_arg0, self->mach_arg1, self->mach_arg2,
-        self->mach_arg3, self->mach_arg4, self->mach_arg5);
-}}
+    def handle_termination_signal(signum: int, _frame: Any) -> None:
+        raise TraceSignal(signum)
 
-mach_trap:::return
-/self->mach_started/
-{{
-    this->elapsed = timestamp - self->mach_started;
-    printf("{{\\\"type\\\":\\\"call\\\",\\\"phase\\\":\\\"return\\\",\\\"provider\\\":\\\"mach_trap\\\",\\\"call\\\":\\\"%s\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"tid\\\":%llu,\\\"return\\\":%lld,\\\"error\\\":null,\\\"duration_ns\\\":%llu}}\\n",
-        probefunc, walltimestamp, pid, tid, arg0, this->elapsed);
-    self->mach_started = 0;
-}}
+    for signum in (signal.SIGHUP, signal.SIGTERM):
+        try:
+            previous_signal_handlers[signum] = signal.signal(
+                signum, handle_termination_signal
+            )
+        except (OSError, ValueError):
+            pass
 
-syscall::exit:entry
-/pid == $target/
-{{
-    printf("{{\\\"type\\\":\\\"process_exit\\\",\\\"ts_ns\\\":%lld,\\\"pid\\\":%d,\\\"status\\\":%d}}\\n",
-        walltimestamp, pid, arg0);
-}}
+    try:
+        wait_for_process_stop(target_process)
+        command = build_xctrace_record_command(
+            tracer, template, bundle_path, target_process.pid
+        )
+        try:
+            tracer_process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            terminate_process_group(target_process)
+            target_process.communicate()
+            raise TraceError("cannot start xctrace: {}".format(exc)) from exc
 
-dtrace:::ERROR
-{{
-    printf("{{\\\"type\\\":\\\"dtrace_error\\\",\\\"ts_ns\\\":%lld}}\\n",
-        walltimestamp);
-}}
+        assert tracer_process.stdout is not None
+        ready = threading.Event()
+        output_thread = threading.Thread(
+            target=pump_xctrace_output,
+            args=(tracer_process.stdout, tracer_chunks, ready),
+            daemon=True,
+        )
+        output_thread.start()
 
-dtrace:::END
-{{
-    printf("{{\\\"type\\\":\\\"trace_end\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"ts_ns\\\":%lld,\\\"target_pid\\\":%d}}\\n",
-        walltimestamp, $target);
-}}
-""".format(
-        initial_active=initial_active,
-        scope=scope,
-        boundary=boundary,
-        subject=subject,
-    )
+        attach_deadline = time.monotonic() + XCTRACE_ATTACH_TIMEOUT
+        while not ready.wait(0.05):
+            if tracer_process.poll() is not None:
+                break
+            if time.monotonic() >= attach_deadline:
+                break
+
+        if not ready.is_set():
+            attach_timed_out = tracer_process.poll() is None
+            terminate_process_group(target_process)
+            _, target_stderr = target_process.communicate()
+            if tracer_process.poll() is None:
+                terminate_process_group(tracer_process)
+            tracer_process.wait()
+            output_thread.join(timeout=2)
+            if attach_timed_out:
+                tracer_chunks.append(
+                    b"xctrace: timed out waiting for the recording to start\n"
+                )
+            tracer_stderr = b"".join(tracer_chunks)
+            write_stderr(target_stderr)
+            write_stderr(tracer_stderr)
+            return tracer_process.returncode, None, tracer_stderr, False
+
+        os.killpg(target_process.pid, signal.SIGCONT)
+        timed_out = False
+        try:
+            _, target_stderr = target_process.communicate(
+                input=sql, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            terminate_process_group(target_process)
+            _, target_stderr = target_process.communicate()
+
+        target_returncode = None if timed_out else target_process.returncode
+        # xctrace normally notices the target exiting and saves by itself; the
+        # interrupt is the fallback for a timeout or a missed exit.
+        try:
+            tracer_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            tracer_process.send_signal(signal.SIGINT)
+            try:
+                tracer_process.wait(timeout=XCTRACE_SAVE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                terminate_process_group(tracer_process)
+                tracer_process.wait()
+        output_thread.join(timeout=2)
+        tracer_stderr = b"".join(tracer_chunks)
+        write_stderr(target_stderr)
+        write_stderr(tracer_stderr)
+        return (
+            tracer_process.returncode,
+            target_returncode,
+            tracer_stderr,
+            timed_out,
+        )
+    except BaseException:
+        if target_process.poll() is None:
+            terminate_process_group(target_process)
+        try:
+            _, remaining_target_stderr = target_process.communicate()
+            target_stderr += remaining_target_stderr
+        except (OSError, ValueError):
+            pass
+        if tracer_process is not None and tracer_process.poll() is None:
+            terminate_process_group(tracer_process)
+        if tracer_process is not None:
+            try:
+                tracer_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        if output_thread is not None:
+            output_thread.join(timeout=2)
+        write_stderr(target_stderr)
+        write_stderr(b"".join(tracer_chunks))
+        raise
+    finally:
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
 
 
 def bpftrace_probe_list(
@@ -1008,34 +1457,6 @@ END
     )
 
 
-def build_dtrace_command(
-    tracer: str,
-    program_path: pathlib.Path,
-    raw_path: pathlib.Path,
-    buffer_size: str,
-    target: Sequence[str],
-) -> List[str]:
-    # DTrace accepts its -c target as one command string. SQL is not included:
-    # it is written verbatim to stdin. shlex.join protects executable/database
-    # path characters from the command parser.
-    target_command = shlex.join(list(target))
-    return [
-        tracer,
-        "-q",
-        "-xmangled",
-        "-b",
-        buffer_size,
-        "-x",
-        "dynvarsize={}".format(buffer_size),
-        "-o",
-        str(raw_path),
-        "-s",
-        str(program_path),
-        "-c",
-        target_command,
-    ]
-
-
 def build_bpftrace_command(
     tracer: str,
     program_path: pathlib.Path,
@@ -1074,37 +1495,27 @@ def build_strace_command(
     ]
 
 
-def dtrace_permission_diagnostic(stderr: str) -> Optional[str]:
-    lowered = stderr.lower()
-    patterns = (
-        "operation not permitted",
-        "permission denied",
-        "failed to initialize dtrace",
-        "requires root",
-        "not permitted by system integrity protection",
-    )
-    if any(pattern in lowered for pattern in patterns):
-        return (
-            "DTrace could not start. Run the command with the privileges required "
-            "by this macOS installation (commonly sudo). If it still fails, SIP "
-            "or a restricted execution environment may prohibit DTrace."
-        )
-    return None
-
-
 def tracer_failure_diagnostic(backend: str, stderr: str) -> Optional[str]:
     lowered = stderr.lower()
-    if backend == "dtrace":
-        permission = dtrace_permission_diagnostic(stderr)
-        if permission:
-            return permission
-        if "failed to match" in lowered or "invalid probe specifier" in lowered:
+    if backend == "xctrace":
+        if "xraugmentationmanager" in lowered or "mac policy error" in lowered:
             return (
-                "DTrace could not enable the resolved DuckDB boundary probe. "
-                "Inspect dtrace-program.d and retry with --scope process."
+                "xctrace aborted before recording. This happens inside an OS "
+                "sandbox such as Seatbelt; run the command outside the sandbox."
             )
-        if "dtrace:" in lowered and ("failed" in lowered or "error" in lowered):
-            return "DTrace reported an instrumentation error; see stderr and dtrace-program.d."
+        if "cannot find template" in lowered:
+            return (
+                "xctrace does not have the requested template. A full Xcode "
+                "installation is required, and Xcode 27 removed System Trace; "
+                "File Activity is the template that records syscalls."
+            )
+        if "failed to attach" in lowered or "unable to attach" in lowered:
+            return (
+                "xctrace could not attach to DuckDB. Verify that the selected "
+                "binary runs and that no other recording holds the process."
+            )
+        if "error" in lowered or "failed" in lowered:
+            return "xctrace reported a recording error; see the output above."
     elif backend == "bpftrace":
         permission_patterns = (
             "operation not permitted",
@@ -1160,12 +1571,7 @@ def tracer_failure_diagnostic(backend: str, stderr: str) -> Optional[str]:
 def dropped_event_count(stderr: str) -> int:
     total = 0
     for line in stderr.splitlines():
-        match = re.search(
-            r"\b([0-9]+)\s+(?:(?:dynamic\s+variable|principal\s+buffer|"
-            r"aggregation|speculation)\s+)?drops?\b",
-            line,
-            re.IGNORECASE,
-        )
+        match = re.search(r"\b([0-9]+)\s+drops?\b", line, re.IGNORECASE)
         if not match:
             match = re.search(
                 r"\b(?:dropped|lost)\s+([0-9]+)\s+(?:records?|events?)\b",
@@ -1192,7 +1598,6 @@ def new_stats() -> Dict[str, Any]:
         "boundary_returns": 0,
         "malformed_lines": 0,
         "target_exit_status": None,
-        "dtrace_errors": 0,
         "trace_starts": 0,
         "trace_ends": 0,
     }
@@ -1224,11 +1629,21 @@ def resolve_linux_syscall_name(number: int) -> str:
             arch_native.restype = ctypes.c_uint32
             resolve_number = library.seccomp_syscall_resolve_num_arch
             resolve_number.argtypes = [ctypes.c_uint32, ctypes.c_int]
-            resolve_number.restype = ctypes.c_char_p
+            resolve_number.restype = ctypes.c_void_p
+            free = ctypes.CDLL(None).free
+            free.argtypes = [ctypes.c_void_p]
+            free.restype = None
             architecture = arch_native()
 
+            @functools.lru_cache(maxsize=1024)
             def resolver(value: int) -> Optional[bytes]:
-                return resolve_number(architecture, value)
+                pointer = resolve_number(architecture, value)
+                if not pointer:
+                    return None
+                try:
+                    return ctypes.string_at(pointer)
+                finally:
+                    free(pointer)
 
             _SYSCALL_NAME_RESOLVER = resolver
         except (AttributeError, OSError):
@@ -1241,7 +1656,7 @@ def resolve_linux_syscall_name(number: int) -> str:
     return "nr_{}".format(number)
 
 
-def summarize_dtrace(path: pathlib.Path) -> Dict[str, Any]:
+def summarize_events(path: pathlib.Path) -> Dict[str, Any]:
     stats = new_stats()
     if not path.exists():
         return stats
@@ -1266,8 +1681,6 @@ def summarize_dtrace(path: pathlib.Path) -> Dict[str, Any]:
                     stats["boundary_returns"] += 1
             elif event_type == "process_exit":
                 stats["target_exit_status"] = event.get("status")
-            elif event_type == "dtrace_error":
-                stats["dtrace_errors"] += 1
             elif event_type == "call" and event.get("phase") == "entry":
                 stats["entry_calls"] += 1
             elif event_type == "call" and event.get("phase") == "return":
@@ -1291,10 +1704,6 @@ def summarize_dtrace(path: pathlib.Path) -> Dict[str, Any]:
                     item["errors"] += 1
                 stats["complete_calls"] += 1
     return stats
-
-
-def summarize_bpftrace(path: pathlib.Path) -> Dict[str, Any]:
-    return summarize_dtrace(path)
 
 
 def strace_line_match(line: str) -> Optional[re.Match[str]]:
@@ -1351,15 +1760,13 @@ def render_summary(
         "Raw trace: {}".format(raw_path),
         "Complete calls: {}".format(stats["complete_calls"]),
     ]
-    if backend in ("dtrace", "bpftrace"):
+    if backend in ("xctrace", "bpftrace"):
         lines.append(
             "Boundary events: {} entry, {} return".format(
                 stats["boundary_entries"], stats["boundary_returns"]
             )
         )
-    if backend == "dtrace":
-        lines.append("DTrace error events: {}".format(stats["dtrace_errors"]))
-    if backend in ("dtrace", "bpftrace"):
+    if backend == "bpftrace":
         if dropped == -1:
             lines.append(
                 "Dropped events: reported by {} (count unavailable)".format(
@@ -1398,6 +1805,150 @@ def render_summary(
     return "\n".join(lines) + "\n"
 
 
+def syscall_category(name: str) -> str:
+    name = normalized_syscall_name(name)
+    if name.startswith("sys_"):
+        name = name[4:]
+    if name.endswith("_nocancel"):
+        name = name[: -len("_nocancel")]
+    return SYSCALL_CATEGORY_BY_NAME.get(name, UNCLASSIFIED_CATEGORY)
+
+
+def classified_syscalls(stats: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = []
+    for qualified_name, item in stats["calls"].items():
+        provider, _, name = qualified_name.partition(":")
+        rows.append(
+            dict(
+                category=syscall_category(name),
+                provider=provider,
+                syscall=name,
+                **item,
+            )
+        )
+    return sorted(
+        rows, key=lambda row: (row["category"], row["provider"], row["syscall"])
+    )
+
+
+def render_classification_csv(stats: Dict[str, Any]) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=(
+            "category", "provider", "syscall", "count", "errors",
+            "total_ns", "max_ns",
+        ),
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    writer.writerows(classified_syscalls(stats))
+    return output.getvalue()
+
+
+def render_classification_report(
+    stats: Dict[str, Any], metadata: Dict[str, Any]
+) -> str:
+    groups: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+    for row in classified_syscalls(stats):
+        groups[row["category"]].append(row)
+    counts = {
+        category: sum(row["count"] for row in rows)
+        for category, rows in groups.items()
+    }
+    ordered = sorted(groups, key=lambda category: (-counts[category], category))
+    total = stats["complete_calls"]
+    lines = [
+        "# DuckDB syscall classification",
+        "",
+        "Run: {} · Backend: {} · Scope: {}".format(
+            metadata["started_at"], metadata["backend"], metadata["scope"]
+        ),
+        "",
+        "**{:,} completed calls, {} distinct provider/name pairs, "
+        "{} observed categories.**".format(total, len(stats["calls"]), len(groups)),
+        "",
+        "Each completed call is classified exactly once by its API purpose. "
+        "Unknown names and unresolved syscall numbers remain in "
+        "**Other / unclassified**.",
+        "",
+        "[Download per-syscall counts and timings](syscall-categories.csv).",
+        "",
+        "Counts measure frequency, not time spent. Descriptor operations such "
+        "as `read`, `write`, `ioctl`, and `fcntl` may act on files, pipes, sockets, "
+        "or terminals; they are not necessarily disk I/O. Synchronization may "
+        "include waiting for HTTP workers or idle workers. Summed syscall "
+        "durations overlap across threads and are not process wall time.",
+        "",
+        "Only completed calls captured by the selected backend and scope are "
+        "included. An absent category does not prove those operations never "
+        "occurred. Error counts inherit the backend's detection limits.",
+    ]
+    warnings = []
+    if metadata.get("timed_out"):
+        warnings.append("The run timed out; this report contains partial data.")
+    if metadata.get("infrastructure_error"):
+        warnings.append(metadata["infrastructure_error"])
+    if metadata.get("boundary_warning"):
+        warnings.append(metadata["boundary_warning"])
+    if metadata.get("duckdb_exit_status") not in (None, 0):
+        warnings.append(
+            "DuckDB exited with status {}.".format(metadata["duckdb_exit_status"])
+        )
+    dropped = metadata.get("dropped_events")
+    if dropped:
+        warnings.append(
+            "The tracer reported {} lost events; this report is incomplete.".format(
+                "an unknown number of" if dropped == -1 else dropped
+            )
+        )
+    if stats["malformed_lines"]:
+        warnings.append(
+            "{} raw lines could not be parsed.".format(stats["malformed_lines"])
+        )
+    if warnings:
+        lines.extend(["", "## Capture notes", ""])
+        lines.extend("- {}".format(warning) for warning in warnings)
+    lines.extend(
+        [
+            "",
+            "## Category totals",
+            "",
+            "| Category | Calls | Share | Provider/name pairs |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for category in ordered:
+        count = counts[category]
+        lines.append(
+            "| {} | {:,} | {:.2f}% | {} |".format(
+                category, count, 100 * count / total if total else 0, len(groups[category])
+            )
+        )
+    if not ordered:
+        lines.extend(["", "No complete calls recorded."])
+    for category in ordered:
+        lines.extend(
+            [
+                "",
+                "## {}".format(category),
+                "",
+                "| Provider | Syscall | Calls | Errors | Total ms | Maximum ms |",
+                "|---|---|---:|---:|---:|---:|",
+            ]
+        )
+        for row in groups[category]:
+            lines.append(
+                "| `{provider}` | `{syscall}` | {count:,} | {errors:,} | "
+                "{total_ms} | {maximum_ms} |".format(
+                    **row,
+                    total_ms=format_duration_ns(row["total_ns"]),
+                    maximum_ms=format_duration_ns(row["max_ns"]),
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
 def atomic_write_text(path: pathlib.Path, text: str) -> None:
     temporary = path.with_name(".{}.tmp-{}".format(path.name, os.getpid()))
     temporary.write_text(text, encoding="utf-8")
@@ -1415,6 +1966,12 @@ def normalize_exit_status(returncode: int) -> int:
 
 
 def metadata_scope_description(scope: str, backend: str) -> str:
+    if scope == "query" and backend == "xctrace":
+        return (
+            "first marker read through last marker read; includes the supplied "
+            "SQL, its DuckDB threads, and the two injected marker statements, "
+            "but excludes startup, extension loading, and shutdown"
+        )
     if scope == "query":
         return (
             "ShellState::ExecuteSQL entry through return; includes SQL parsing, "
@@ -1436,13 +1993,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args = parse_args(argv)
         backend = select_backend(args.backend, scope=args.scope)
         scope = select_scope(args.scope, backend)
+        children = select_children(args.children, backend)
         if backend == "strace" and scope != "process":
             raise TraceError(
                 "{} scope is not available with baseline strace because strace "
                 "cannot observe DuckDB C++ function boundaries; use --scope process "
                 "or use the bpftrace backend on Linux".format(scope)
             )
-        if backend == "strace" and not args.children:
+        if backend == "strace" and not children:
             raise TraceError(
                 "--no-children is not supported by the strace backend: -f is "
                 "required for DuckDB worker threads and also follows descendants"
@@ -1451,6 +2009,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise TraceError(
                 "process scope is not supported by the bpftrace backend; "
                 "use --backend strace --scope process"
+            )
+        if backend == "xctrace" and scope == "engine":
+            raise TraceError(
+                "engine scope is not available with xctrace: Connection::Query "
+                "has no observable side effect to mark, and xctrace cannot "
+                "probe C++ function boundaries; use --scope query or "
+                "--scope process"
             )
 
         sql = read_sql(args)
@@ -1465,21 +2030,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pass
 
         symbols: List[Tuple[str, str]] = []
-        if backend in ("dtrace", "bpftrace") and scope != "process":
+        if backend == "bpftrace" and scope != "process":
             symbols = resolve_boundary_symbols(binary, scope)
 
-        target = duckdb_command(binary, database)
-        if backend == "dtrace":
-            program_path = paths["program"]
-            assert program_path is not None
-            program = build_dtrace_program(
-                scope, [symbol for symbol, _ in symbols], args.children
-            )
-            atomic_write_text(program_path, program)
-            command = build_dtrace_command(
-                tracer, program_path, raw_path, args.buffer_size, target
-            )
-        elif backend == "strace":
+        # query_sha256 and query_bytes describe the SQL the caller supplied, so
+        # the marker-wrapped copy stays separate.
+        traced_sql = sql
+        markers: Optional[Tuple[pathlib.Path, pathlib.Path]] = None
+        nonce = ""
+        if backend == "xctrace":
+            ensure_xctrace_template(tracer, args.template)
+            if scope == "query":
+                nonce = uuid.uuid4().hex[:12]
+                output_dir = paths["output_dir"]
+                assert output_dir is not None
+                markers = marker_paths(output_dir, nonce)
+                write_marker_files(*markers)
+                traced_sql = wrap_sql_with_markers(sql, *markers)
+
+        target = duckdb_command(binary, database, args.duckdb_args)
+        if backend == "strace":
             command = build_strace_command(
                 tracer, raw_path, args.string_limit, target
             )
@@ -1487,15 +2057,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             command = []
 
         duckdb_version = command_version([binary, "--version"])
-        tracer_version = command_version([tracer, "-V"])
+        tracer_version = command_version(
+            [tracer, "version"] if backend == "xctrace" else [tracer, "-V"]
+        )
 
-        bpftrace_target_returncode: Optional[int] = None
+        attached_target_returncode: Optional[int] = None
+        window: Optional[Tuple[int, int]] = None
+        exported_rows = 0
         if backend == "bpftrace":
             program_path = paths["program"]
             assert program_path is not None
             (
                 tracer_returncode,
-                bpftrace_target_returncode,
+                attached_target_returncode,
                 stderr_bytes,
                 timed_out,
             ) = run_bpftrace(
@@ -1505,27 +2079,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 binary,
                 [symbol for symbol, _ in symbols],
                 scope,
-                args.children,
+                children,
                 target,
-                sql,
+                traced_sql,
                 args.timeout,
                 args.no_results,
             )
+        elif backend == "xctrace":
+            bundle_path = paths["bundle"]
+            assert bundle_path is not None
+            (
+                tracer_returncode,
+                attached_target_returncode,
+                stderr_bytes,
+                timed_out,
+            ) = run_xctrace(
+                tracer,
+                args.template,
+                bundle_path,
+                target,
+                traced_sql,
+                args.timeout,
+                args.no_results,
+            )
+            if bundle_path.exists():
+                rows = export_fssyscall_rows(tracer, bundle_path)
+                exported_rows = len(rows)
+                if scope == "query":
+                    window = find_marker_window(rows, nonce)
+                write_xctrace_jsonl(
+                    rows, raw_path, scope, window, rows[0]["pid"] if rows else None
+                )
         else:
             tracer_returncode, stderr_bytes, timed_out = run_tracer(
-                command, sql, args.timeout, args.no_results
+                command, traced_sql, args.timeout, args.no_results
             )
         stderr_text = stderr_bytes.decode("utf-8", "replace")
         ended = utc_now()
-        dropped = (
-            dropped_event_count(stderr_text)
-            if backend in ("dtrace", "bpftrace")
-            else 0
-        )
-        if backend == "dtrace":
-            stats = summarize_dtrace(raw_path)
-        elif backend == "bpftrace":
-            stats = summarize_bpftrace(raw_path)
+        dropped = dropped_event_count(stderr_text) if backend == "bpftrace" else 0
+        if backend in ("xctrace", "bpftrace"):
+            stats = summarize_events(raw_path)
         else:
             stats = summarize_strace(raw_path)
 
@@ -1534,18 +2127,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if timed_out:
             process_status: Optional[int] = None
             effective_status = TIMEOUT_EXIT_STATUS
-        elif backend in ("dtrace", "bpftrace"):
-            if backend == "dtrace":
-                target_status = stats.get("target_exit_status")
-                process_status = (
-                    int(target_status) if target_status is not None else None
-                )
-            else:
-                process_status = (
-                    normalize_exit_status(bpftrace_target_returncode)
-                    if bpftrace_target_returncode is not None
-                    else None
-                )
+        elif backend in ("xctrace", "bpftrace"):
+            process_status = (
+                normalize_exit_status(attached_target_returncode)
+                if attached_target_returncode is not None
+                else None
+            )
             if stats["trace_starts"] == 0:
                 infrastructure_error = tracer_failure_diagnostic(
                     backend, stderr_text
@@ -1559,11 +2146,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         normalize_exit_status(tracer_returncode)
                     )
                 )
-            elif backend == "dtrace" and stats["dtrace_errors"]:
+            elif backend == "xctrace" and exported_rows == 0:
                 infrastructure_error = (
-                    "DTrace reported {} runtime error event(s).".format(
-                        stats["dtrace_errors"]
-                    )
+                    "xctrace recorded no {} rows; the template captured no "
+                    "syscalls for DuckDB.".format(FSSYSCALL_SCHEMA)
                 )
             elif process_status is None:
                 infrastructure_error = (
@@ -1575,8 +2161,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 and infrastructure_error is None
             ):
                 boundary_message = (
-                    "The resolved {} boundary was never observed; the trace is not "
-                    "query-scoped.".format(scope)
+                    "The injected {} markers were never observed; the trace is "
+                    "not query-scoped.".format(scope)
+                    if backend == "xctrace"
+                    else "The resolved {} boundary was never observed; the "
+                    "trace is not query-scoped.".format(scope)
                 )
                 if process_status:
                     boundary_warning = (
@@ -1637,17 +2226,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "backend": backend,
             "tracer": {"path": tracer, "version": tracer_version},
             "duckdb": {"path": binary, "version": duckdb_version},
+            "duckdb_args": list(args.duckdb_args),
             "database_path": database_metadata_value(database),
             "scope": scope,
             "scope_description": metadata_scope_description(scope, backend),
-            "children": args.children,
+            "children": children,
             "query_sha256": hashlib.sha256(sql).hexdigest(),
             "query_bytes": len(sql),
             "started_at": isoformat(started),
             "ended_at": isoformat(ended),
             "elapsed_seconds": round((ended - started).total_seconds(), 6),
             "timeout_seconds": args.timeout,
-            "buffer_size": args.buffer_size if backend == "dtrace" else None,
+            "template": args.template if backend == "xctrace" else None,
+            "trace_bundle": str(paths["bundle"]) if paths["bundle"] else None,
+            "markers_injected": markers is not None,
+            "marker_files": [str(path) for path in markers] if markers else [],
+            "query_window_ns": (window[1] - window[0]) if window else None,
+            "exported_rows": exported_rows if backend == "xctrace" else None,
             "string_limit": args.string_limit if backend == "strace" else None,
             "timed_out": timed_out,
             "duckdb_exit_status": process_status,
@@ -1655,26 +2250,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "effective_exit_status": effective_status,
             "raw_trace": str(raw_path),
             "summary": str(summary_path) if summary_path else None,
-            "dropped_events": (
-                dropped if backend in ("dtrace", "bpftrace") else None
-            ),
+            "classification_report": str(paths["classification_report"]),
+            "classification_csv": str(paths["classification_csv"]),
+            "dropped_events": dropped if backend == "bpftrace" else None,
             "complete_calls": stats["complete_calls"],
             "boundary_entries": stats["boundary_entries"]
-            if backend in ("dtrace", "bpftrace")
+            if backend in ("xctrace", "bpftrace")
             else None,
             "boundary_returns": stats["boundary_returns"]
-            if backend in ("dtrace", "bpftrace")
+            if backend in ("xctrace", "bpftrace")
             else None,
             "boundary_warning": boundary_warning,
-            "dtrace_error_events": stats["dtrace_errors"]
-            if backend == "dtrace"
-            else None,
             "boundary_symbols": [
                 {"mangled": symbol, "demangled": readable}
                 for symbol, readable in symbols
             ],
             "infrastructure_error": infrastructure_error,
         }
+        classification_report = paths["classification_report"]
+        classification_csv = paths["classification_csv"]
+        assert classification_report is not None and classification_csv is not None
+        atomic_write_text(
+            classification_report, render_classification_report(stats, metadata)
+        )
+        atomic_write_text(classification_csv, render_classification_csv(stats))
         metadata_path = paths["metadata"]
         assert metadata_path is not None
         atomic_write_json(metadata_path, metadata)
@@ -1682,19 +2281,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         eprint("Raw trace: {}".format(raw_path))
         if summary_path is not None:
             eprint("Summary: {}".format(summary_path))
+        eprint("Classification report: {}".format(classification_report))
+        eprint("Classification CSV: {}".format(classification_csv))
         eprint("Metadata: {}".format(metadata_path))
         if dropped:
             count_text = "an unknown number of" if dropped == -1 else str(dropped)
-            if backend == "dtrace":
-                eprint(
-                    "warning: DTrace reported {} dropped events; "
-                    "increase --buffer-size".format(count_text)
-                )
-            else:
-                eprint(
-                    "warning: bpftrace reported {} lost events; "
-                    "the trace may be incomplete".format(count_text)
-                )
+            eprint(
+                "warning: bpftrace reported {} lost events; "
+                "the trace may be incomplete".format(count_text)
+            )
         if infrastructure_error:
             eprint("trace error: {}".format(infrastructure_error))
         if boundary_warning:
